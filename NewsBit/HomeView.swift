@@ -16,6 +16,8 @@ struct HomeView: View {
                 .ignoresSafeArea()
 
                 GeometryReader { geometry in
+                    let cardWidth = geometry.size.width
+
                     ZStack {
                         ForEach(Array(viewModel.cards.enumerated()), id: \.element.id) { index, card in
                             SwipeableNewsCardView(
@@ -35,10 +37,11 @@ struct HomeView: View {
                                     }
                                 }
                             )
-                            .frame(width: geometry.size.width, height: geometry.size.height)
+                            .frame(width: cardWidth, height: geometry.size.height)
                             .offset(y: CGFloat(viewModel.cards.count - 1 - index) * 6)
                             .scaleEffect(1 - CGFloat(viewModel.cards.count - 1 - index) * 0.03)
                             .zIndex(Double(index))
+                            .clipped()
                         }
 
                         if viewModel.cards.isEmpty {
@@ -69,9 +72,11 @@ struct HomeView: View {
                             .padding(.horizontal, 24)
                         }
                     }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .frame(width: cardWidth, height: geometry.size.height)
+                    .clipped()
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .clipped()
             }
             .navigationBarHidden(true)
             .navigationDestination(isPresented: $isShowingDetail) {
@@ -98,8 +103,35 @@ struct SwipeableNewsCardView: View {
         GeometryReader { geometry in
             VStack(spacing: 0) {
                 ZStack(alignment: .topTrailing) {
-                    Rectangle()
-                        .fill(card.imageGradient)
+                    Group {
+                        if let imageURL = card.imageURL {
+                            AsyncImage(url: imageURL) { phase in
+                                switch phase {
+                                case .success(let image):
+                                    image
+                                        .resizable()
+                                        .scaledToFill()
+                                default:
+                                    Rectangle()
+                                        .fill(card.imageGradient)
+                                        .overlay(alignment: .center) {
+                                            Image(systemName: card.thumbnailSymbol)
+                                                .font(.system(size: 78, weight: .bold))
+                                                .foregroundStyle(.white.opacity(0.8))
+                                        }
+                                }
+                            }
+                        } else {
+                            Rectangle()
+                                .fill(card.imageGradient)
+                                .overlay(alignment: .center) {
+                                    Image(systemName: card.thumbnailSymbol)
+                                        .font(.system(size: 78, weight: .bold))
+                                        .foregroundStyle(.white.opacity(0.8))
+                                }
+                        }
+                    }
+                    .clipped()
                         .overlay(alignment: .bottomLeading) {
                             Text(card.source)
                                 .font(.caption.weight(.semibold))
@@ -108,11 +140,6 @@ struct SwipeableNewsCardView: View {
                                 .padding(.vertical, 6)
                                 .background(.black.opacity(0.55), in: Capsule())
                                 .padding(14)
-                        }
-                        .overlay(alignment: .center) {
-                            Image(systemName: card.thumbnailSymbol)
-                                .font(.system(size: 78, weight: .bold))
-                                .foregroundStyle(.white.opacity(0.8))
                         }
 
                     Image(systemName: "ellipsis")
@@ -201,14 +228,36 @@ struct NewsDetailView: View {
         ScrollView {
             VStack(spacing: 0) {
                 ZStack(alignment: .bottomLeading) {
-                    RoundedRectangle(cornerRadius: 0)
-                        .fill(card.imageGradient)
-                        .frame(height: 300)
-                        .overlay {
-                            Image(systemName: card.thumbnailSymbol)
-                                .font(.system(size: 96, weight: .bold))
-                                .foregroundStyle(.white.opacity(0.8))
+                    Group {
+                        if let imageURL = card.imageURL {
+                            AsyncImage(url: imageURL) { phase in
+                                switch phase {
+                                case .success(let image):
+                                    image
+                                        .resizable()
+                                        .scaledToFill()
+                                default:
+                                    Rectangle()
+                                        .fill(card.imageGradient)
+                                        .overlay {
+                                            Image(systemName: card.thumbnailSymbol)
+                                                .font(.system(size: 96, weight: .bold))
+                                                .foregroundStyle(.white.opacity(0.8))
+                                        }
+                                }
+                            }
+                        } else {
+                            Rectangle()
+                                .fill(card.imageGradient)
+                                .overlay {
+                                    Image(systemName: card.thumbnailSymbol)
+                                        .font(.system(size: 96, weight: .bold))
+                                        .foregroundStyle(.white.opacity(0.8))
+                                }
                         }
+                    }
+                    .frame(height: 300)
+                    .clipped()
 
                     Text(card.source)
                         .font(.caption.weight(.semibold))

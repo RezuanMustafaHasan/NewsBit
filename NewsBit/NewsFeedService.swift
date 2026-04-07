@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import Combine
 
 struct NewsCard: Identifiable {
     let id: String
@@ -9,6 +10,7 @@ struct NewsCard: Identifiable {
     let summary: String
     let fullText: String
     let commentCount: Int
+    let imageURL: URL?
     let thumbnailSymbol: String
     let imageGradient: LinearGradient
 }
@@ -76,7 +78,11 @@ final class NewsFeedViewModel: ObservableObject {
             nextPage += 1
             loadError = nil
         } catch {
-            loadError = "Unable to load feed. Please try again."
+            if let feedError = error as? FeedError {
+                loadError = feedError.localizedDescription
+            } else {
+                loadError = "Unable to load feed. Please try again."
+            }
         }
     }
 }
@@ -94,6 +100,11 @@ private struct FeedEnvelope: Decodable {
         let keyed = try decoder.container(keyedBy: AnyCodingKey.self)
 
         if let value = try keyed.decodeIfPresent([FeedItem].self, forKey: AnyCodingKey("data")) {
+            items = value
+            return
+        }
+
+        if let value = try keyed.decodeIfPresent([FeedItem].self, forKey: AnyCodingKey("content")) {
             items = value
             return
         }
@@ -124,17 +135,18 @@ private struct FeedItem: Decodable {
     let summary: String
     let content: String
     let publishedAt: Date?
+    let imageURL: URL?
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: AnyCodingKey.self)
 
-        id = Self.decodeString(container, keys: ["id", "_id", "uuid", "newsId", "articleId"]) ?? UUID().uuidString
+        id = Self.decodeIdentifier(container, keys: ["id", "_id", "uuid", "newsId", "articleId"]) ?? UUID().uuidString
 
         source = Self.decodeNestedString(
             container,
             parentKeys: ["source"],
             childKeys: ["name", "title"]
-        ) ?? Self.decodeString(container, keys: ["source", "sourceName", "publisher"]) ?? "NewsBit"
+        ) ?? Self.decodeString(container, keys: ["source", "sourceName", "publisher", "categoryLabel", "category"]) ?? "NewsBit"
 
         title = Self.decodeString(container, keys: ["title", "headline"]) ?? "Untitled"
 
@@ -143,15 +155,40 @@ private struct FeedItem: Decodable {
         content = Self.decodeString(container, keys: ["content", "body", "text"]) ?? summary
 
         publishedAt = Self.decodeDate(container, keys: ["publishedAt", "published_at", "createdAt", "created_at", "date"])
+
+        if let rawImageURL = Self.decodeString(container, keys: ["imageUrl", "imageURL", "image", "thumbnail"]) {
+            imageURL = URL(string: rawImageURL)
+        } else {
+            imageURL = nil
+        }
+    }
+
+    private static func decodeIdentifier(_ container: KeyedDecodingContainer<AnyCodingKey>, keys: [String]) -> String? {
+        for key in keys {
+            let codingKey = AnyCodingKey(key)
+
+            if let intValue = try? container.decodeIfPresent(Int.self, forKey: codingKey) {
+                return String(intValue)
+            }
+
+            if let stringValue = (try? container.decodeIfPresent(String.self, forKey: codingKey)) ?? nil {
+                let trimmed = stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    return trimmed
+                }
+            }
+        }
+        return nil
     }
 
     private static func decodeString(_ container: KeyedDecodingContainer<AnyCodingKey>, keys: [String]) -> String? {
         for key in keys {
             let codingKey = AnyCodingKey(key)
-            if let value = try? container.decodeIfPresent(String.self, forKey: codingKey),
-               let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !trimmed.isEmpty {
-                return trimmed
+            if let value = (try? container.decodeIfPresent(String.self, forKey: codingKey)) ?? nil {
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    return trimmed
+                }
             }
         }
         return nil
@@ -170,10 +207,11 @@ private struct FeedItem: Decodable {
 
             for childKey in childKeys {
                 let nestedKey = AnyCodingKey(childKey)
-                if let value = try? nested.decodeIfPresent(String.self, forKey: nestedKey),
-                   let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
-                   !trimmed.isEmpty {
-                    return trimmed
+                if let value = (try? nested.decodeIfPresent(String.self, forKey: nestedKey)) ?? nil {
+                    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty {
+                        return trimmed
+                    }
                 }
             }
         }
@@ -184,19 +222,19 @@ private struct FeedItem: Decodable {
         for key in keys {
             let codingKey = AnyCodingKey(key)
 
-            if let timestamp = try? container.decodeIfPresent(Double.self, forKey: codingKey),
-               let value = timestamp {
+            if let value = try? container.decodeIfPresent(Double.self, forKey: codingKey) {
                 return Date(timeIntervalSince1970: value)
             }
 
-            if let timestamp = try? container.decodeIfPresent(Int.self, forKey: codingKey),
-               let value = timestamp {
+            if let value = try? container.decodeIfPresent(Int.self, forKey: codingKey) {
                 return Date(timeIntervalSince1970: Double(value))
             }
 
-            if let stringValue = try? container.decodeIfPresent(String.self, forKey: codingKey),
-               let raw = stringValue {
-                if let date = ISO8601DateFormatter.withFractional.date(from: raw) ?? ISO8601DateFormatter.standard.date(from: raw) {
+            if let raw = try? container.decodeIfPresent(String.self, forKey: codingKey) {
+                if let date = ISO8601DateFormatter.withFractional.date(from: raw)
+                    ?? ISO8601DateFormatter.standard.date(from: raw)
+                    ?? DateFormatter.iso8601NoTimezone.date(from: raw)
+                    ?? DateFormatter.iso8601NoTimezoneNoFractional.date(from: raw) {
                     return date
                 }
             }
@@ -216,6 +254,7 @@ private struct FeedItem: Decodable {
             summary: summary.isEmpty ? content : summary,
             fullText: content.isEmpty ? summary : content,
             commentCount: 0,
+            imageURL: imageURL,
             thumbnailSymbol: style.symbol,
             imageGradient: style.gradient
         )
@@ -269,16 +308,53 @@ private struct NewsFeedService {
             throw URLError(.badURL)
         }
 
-        let (data, response) = try await URLSession.shared.data(from: url)
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Basic cHVibGljOjEyMzQ1Njc4", forHTTPHeaderField: "Authorization")
 
-        guard let httpResponse = response as? HTTPURLResponse,
-              (200...299).contains(httpResponse.statusCode) else {
-            throw URLError(.badServerResponse)
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw FeedError.invalidResponse
+        }
+
+        if httpResponse.statusCode == 401 {
+            throw FeedError.unauthorized
+        }
+
+        guard (200...299).contains(httpResponse.statusCode) else {
+            throw FeedError.requestFailed(statusCode: httpResponse.statusCode)
         }
 
         let decoder = JSONDecoder()
-        let envelope = try decoder.decode(FeedEnvelope.self, from: data)
-        return envelope.items
+        do {
+            let envelope = try decoder.decode(FeedEnvelope.self, from: data)
+            return envelope.items
+        } catch {
+            throw FeedError.decodingFailed
+        }
+    }
+
+}
+
+private enum FeedError: LocalizedError {
+    case unauthorized
+    case requestFailed(statusCode: Int)
+    case decodingFailed
+    case invalidResponse
+
+    var errorDescription: String? {
+        switch self {
+        case .unauthorized:
+            return "Feed API unauthorized. Check Basic auth credentials."
+        case .requestFailed(let statusCode):
+            return "Feed API request failed (HTTP \(statusCode))."
+        case .decodingFailed:
+            return "Feed API response format is unexpected."
+        case .invalidResponse:
+            return "Feed API returned an invalid response."
+        }
     }
 }
 
@@ -312,6 +388,24 @@ private extension ISO8601DateFormatter {
     static let withFractional: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+}
+
+private extension DateFormatter {
+    static let iso8601NoTimezone: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSSSS"
+        return formatter
+    }()
+
+    static let iso8601NoTimezoneNoFractional: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
         return formatter
     }()
 }

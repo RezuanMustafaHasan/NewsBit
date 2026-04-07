@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct AuthenticationView: View {
     enum AuthMode: String, CaseIterable {
