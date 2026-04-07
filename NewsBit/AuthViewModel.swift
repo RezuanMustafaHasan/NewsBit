@@ -10,18 +10,38 @@ final class AuthViewModel: ObservableObject {
     @Published var isLoading = false
     @Published var authError: String?
 
-    private let db = Firestore.firestore()
+    private let db: Firestore?
+    private let usesFirebase: Bool
     private let errorDomain = "NewsBitAuth"
+
+    static func previewMock() -> AuthViewModel {
+        let viewModel = AuthViewModel(usesFirebase: true)
+        viewModel.currentUser = nil
+        viewModel.profile = nil
+        viewModel.authError = nil
+        return viewModel
+    }
 
     var isAuthenticated: Bool {
         currentUser != nil
     }
 
-    init() {
-        currentUser = Auth.auth().currentUser
+    private var firestore: Firestore {
+        guard let db else {
+            fatalError("Firestore used while Firebase is disabled")
+        }
+        return db
+    }
+
+    init(usesFirebase: Bool = true) {
+        self.usesFirebase = usesFirebase
+        self.db = usesFirebase ? Firestore.firestore() : nil
+        currentUser = usesFirebase ? Auth.auth().currentUser : nil
     }
 
     func restoreSession() {
+        guard usesFirebase else { return }
+
         currentUser = Auth.auth().currentUser
 
         guard currentUser != nil else {
@@ -35,6 +55,8 @@ final class AuthViewModel: ObservableObject {
     }
 
     func signIn(identifier: String, password: String) async {
+        guard usesFirebase else { return }
+
         authError = nil
 
         let cleanedIdentifier = identifier.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -67,6 +89,8 @@ final class AuthViewModel: ObservableObject {
     }
 
     func register(username: String, email: String, password: String, gender: String) async {
+        guard usesFirebase else { return }
+
         authError = nil
 
         let cleanedUsername = username.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -126,6 +150,13 @@ final class AuthViewModel: ObservableObject {
     }
 
     func signOut() {
+        guard usesFirebase else {
+            currentUser = nil
+            profile = nil
+            authError = nil
+            return
+        }
+
         do {
             try Auth.auth().signOut()
             currentUser = nil
@@ -137,6 +168,8 @@ final class AuthViewModel: ObservableObject {
     }
 
     func fetchProfile() async {
+        guard usesFirebase else { return }
+
         guard let uid = currentUser?.uid else {
             profile = nil
             return
@@ -165,11 +198,12 @@ final class AuthViewModel: ObservableObject {
     }
 
     func updateAvatarColor(hex: String) async {
+        guard usesFirebase else { return }
         guard let uid = currentUser?.uid else { return }
 
         do {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                db.collection("users").document(uid).setData([
+                firestore.collection("users").document(uid).setData([
                     "avatarColorHex": hex,
                     "updatedAt": FieldValue.serverTimestamp()
                 ], merge: true) { error in
@@ -208,8 +242,8 @@ final class AuthViewModel: ObservableObject {
         )
 
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            db.runTransaction { transaction, errorPointer in
-                let usernameRef = self.db.collection("usernames").document(usernameKey)
+            firestore.runTransaction { transaction, errorPointer in
+                let usernameRef = self.firestore.collection("usernames").document(usernameKey)
 
                 do {
                     let snapshot = try transaction.getDocument(usernameRef)
@@ -242,7 +276,7 @@ final class AuthViewModel: ObservableObject {
 
     private func saveUserProfile(uid: String, username: String, email: String, gender: String, avatarColorHex: String) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            db.collection("users").document(uid).setData([
+            firestore.collection("users").document(uid).setData([
                 "uid": uid,
                 "username": username,
                 "email": email,
@@ -261,7 +295,7 @@ final class AuthViewModel: ObservableObject {
 
     private func getDocument(collection: String, documentID: String) async throws -> DocumentSnapshot {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<DocumentSnapshot, Error>) in
-            db.collection(collection).document(documentID).getDocument { snapshot, error in
+            firestore.collection(collection).document(documentID).getDocument { snapshot, error in
                 if let error {
                     continuation.resume(throwing: error)
                 } else if let snapshot {

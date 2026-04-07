@@ -1,7 +1,16 @@
 import SwiftUI
 
+@MainActor
 struct ContentView: View {
-    @StateObject private var authViewModel = AuthViewModel()
+    @StateObject private var authViewModel: AuthViewModel
+
+    init() {
+        _authViewModel = StateObject(wrappedValue: AuthViewModel())
+    }
+
+    init(authViewModel: AuthViewModel) {
+        _authViewModel = StateObject(wrappedValue: authViewModel)
+    }
 
     var body: some View {
         Group {
@@ -18,5 +27,5 @@ struct ContentView: View {
 }
 
 #Preview {
-    ContentView()
+    ContentView(authViewModel: .previewMock())
 }

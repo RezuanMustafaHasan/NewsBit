@@ -1,4 +1,5 @@
 import SwiftUI
+import FirebaseAuth
 
 @MainActor
 struct ProfileView: View {
