@@ -15,7 +15,7 @@ final class AuthViewModel: ObservableObject {
     private let errorDomain = "NewsBitAuth"
 
     static func previewMock() -> AuthViewModel {
-        let viewModel = AuthViewModel(usesFirebase: false)
+        let viewModel = AuthViewModel(usesFirebase: true)
         viewModel.currentUser = nil
         viewModel.profile = nil
         viewModel.authError = nil
