@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import Combine
+import FirebaseFirestore
 
 struct NewsCard: Identifiable {
     let id: String
@@ -20,13 +21,25 @@ final class NewsFeedViewModel: ObservableObject {
     @Published private(set) var cards: [NewsCard] = []
     @Published private(set) var isLoading = false
     @Published var loadError: String?
+    @Published private(set) var favoriteCardIDs: Set<String> = []
+    @Published private(set) var highlightedCardIDs: Set<String> = []
 
-    private let service = NewsFeedService()
+    private let service: NewsFeedService
+    private let interactionStore: NewsInteractionStore?
     private let pageSize = 20
     private let prefetchThreshold = 10
 
     private var nextPage = 0
     private var reachedEnd = false
+
+    init(userID: String? = nil) {
+        self.service = NewsFeedService()
+        if let userID, !userID.isEmpty {
+            self.interactionStore = NewsInteractionStore(userID: userID)
+        } else {
+            self.interactionStore = nil
+        }
+    }
 
     func loadInitialIfNeeded() async {
         guard cards.isEmpty else { return }
@@ -38,6 +51,8 @@ final class NewsFeedViewModel: ObservableObject {
         nextPage = 0
         reachedEnd = false
         loadError = nil
+        favoriteCardIDs.removeAll()
+        highlightedCardIDs.removeAll()
         await fetchNextPage(prepend: true)
     }
 
@@ -51,6 +66,68 @@ final class NewsFeedViewModel: ObservableObject {
         }
 
         await fetchNextPage(prepend: true)
+    }
+
+    func isFavorite(_ card: NewsCard) -> Bool {
+        favoriteCardIDs.contains(card.id)
+    }
+
+    func isHighlighted(_ card: NewsCard) -> Bool {
+        highlightedCardIDs.contains(card.id)
+    }
+
+    func toggleFavorite(for card: NewsCard) async {
+        guard let interactionStore else { return }
+
+        if favoriteCardIDs.contains(card.id) {
+            favoriteCardIDs.remove(card.id)
+            do {
+                try await interactionStore.removeFavorite(cardID: card.id)
+            } catch {
+                favoriteCardIDs.insert(card.id)
+            }
+        } else {
+            favoriteCardIDs.insert(card.id)
+            do {
+                try await interactionStore.saveFavorite(card: card)
+            } catch {
+                favoriteCardIDs.remove(card.id)
+            }
+        }
+    }
+
+    func toggleHighlight(for card: NewsCard) async {
+        guard let interactionStore else { return }
+
+        if highlightedCardIDs.contains(card.id) {
+            highlightedCardIDs.remove(card.id)
+            do {
+                try await interactionStore.removeHighlight(cardID: card.id)
+            } catch {
+                highlightedCardIDs.insert(card.id)
+            }
+        } else {
+            highlightedCardIDs.insert(card.id)
+            do {
+                try await interactionStore.saveHighlight(card: card)
+            } catch {
+                highlightedCardIDs.remove(card.id)
+            }
+        }
+    }
+
+    private func syncInteractionStateForLoadedCards() async {
+        guard let interactionStore else { return }
+
+        let cardIDs = cards.map(\.id)
+        do {
+            async let favorites = interactionStore.fetchFavoriteIDs(in: cardIDs)
+            async let highlights = interactionStore.fetchHighlightIDs(in: cardIDs)
+            favoriteCardIDs = try await favorites
+            highlightedCardIDs = try await highlights
+        } catch {
+            // Keep UI responsive if interaction fetch fails.
+        }
     }
 
     private func fetchNextPage(prepend: Bool) async {
@@ -77,6 +154,7 @@ final class NewsFeedViewModel: ObservableObject {
 
             nextPage += 1
             loadError = nil
+            await syncInteractionStateForLoadedCards()
         } catch {
             if let feedError = error as? FeedError {
                 loadError = feedError.localizedDescription
@@ -128,7 +206,7 @@ private struct FeedEnvelope: Decodable {
     }
 }
 
-private struct FeedItem: Decodable {
+struct FeedItem: Decodable {
     let id: String
     let source: String
     let title: String
@@ -294,7 +372,94 @@ private enum NewsCardStyle: CaseIterable {
     }
 }
 
-private struct NewsFeedService {
+private struct NewsInteractionStore {
+    private let db = Firestore.firestore()
+    private let userID: String
+
+    init(userID: String) {
+        self.userID = userID
+    }
+
+    func saveFavorite(card: NewsCard) async throws {
+        try await saveCard(card, in: "favorites")
+    }
+
+    func removeFavorite(cardID: String) async throws {
+        try await removeCard(cardID: cardID, from: "favorites")
+    }
+
+    func saveHighlight(card: NewsCard) async throws {
+        try await saveCard(card, in: "highlights")
+    }
+
+    func removeHighlight(cardID: String) async throws {
+        try await removeCard(cardID: cardID, from: "highlights")
+    }
+
+    func fetchFavoriteIDs(in cardIDs: [String]) async throws -> Set<String> {
+        try await fetchIDs(in: "favorites", cardIDs: cardIDs)
+    }
+
+    func fetchHighlightIDs(in cardIDs: [String]) async throws -> Set<String> {
+        try await fetchIDs(in: "highlights", cardIDs: cardIDs)
+    }
+
+    private func saveCard(_ card: NewsCard, in container: String) async throws {
+        let entryID = pairDocumentID(userID: userID, newsID: card.id)
+        try await db.collection(container)
+            .document(entryID)
+            .setData([
+                "entryId": entryID,
+                "userID": userID,
+                "newsId": card.id,
+                "title": card.title,
+                "source": card.source,
+                "timeText": card.time,
+                "summary": card.summary,
+                "fullText": card.fullText,
+                "thumbnailSymbol": card.thumbnailSymbol,
+                "imageURL": card.imageURL?.absoluteString ?? "",
+                "savedAt": FieldValue.serverTimestamp()
+            ], merge: true)
+    }
+
+    private func removeCard(cardID: String, from container: String) async throws {
+        let entryID = pairDocumentID(userID: userID, newsID: cardID)
+        try await db.collection(container)
+            .document(entryID)
+            .delete()
+    }
+
+    private func fetchIDs(in container: String, cardIDs: [String]) async throws -> Set<String> {
+        guard !cardIDs.isEmpty else { return [] }
+
+        var matchedIDs = Set<String>()
+        let chunks = stride(from: 0, to: cardIDs.count, by: 10).map { startIndex in
+            Array(cardIDs[startIndex..<min(startIndex + 10, cardIDs.count)])
+        }
+
+        for chunk in chunks where !chunk.isEmpty {
+            let snapshot = try await db.collection(container)
+                .whereField("userID", isEqualTo: userID)
+                .whereField("newsId", in: chunk)
+                .getDocuments()
+
+            snapshot.documents.forEach { document in
+                if let newsID = document.data()["newsId"] as? String {
+                    matchedIDs.insert(newsID)
+                }
+            }
+        }
+
+        return matchedIDs
+    }
+
+    private func pairDocumentID(userID: String, newsID: String) -> String {
+        "\(userID)_\(newsID)"
+    }
+}
+
+struct NewsFeedService {
     private let baseURL = URL(string: "https://newsbitapi.onrender.com")!
 
     func fetchFeed(page: Int, limit: Int) async throws -> [FeedItem] {
@@ -334,6 +499,23 @@ private struct NewsFeedService {
         } catch {
             throw FeedError.decodingFailed
         }
+    }
+
+    func fetchCard(matching cardID: String, pageSize: Int = 20, maxPages: Int = 6) async throws -> NewsCard? {
+        guard !cardID.isEmpty else { return nil }
+
+        for page in 0..<maxPages {
+            let items = try await fetchFeed(page: page, limit: pageSize)
+            if let matchedIndex = items.firstIndex(where: { $0.id == cardID }) {
+                return items[matchedIndex].toNewsCard(styleIndex: (page * pageSize) + matchedIndex)
+            }
+
+            if items.count < pageSize {
+                break
+            }
+        }
+
+        return nil
     }
 
 }

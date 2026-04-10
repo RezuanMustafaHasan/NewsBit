@@ -1,8 +1,10 @@
 import SwiftUI
+import FirebaseAuth
 
 struct MainTabShellView: View {
     enum Tab {
         case home
+        case favorites
         case search
         case profile
     }
@@ -15,7 +17,9 @@ struct MainTabShellView: View {
             Group {
                 switch selectedTab {
                 case .home:
-                    HomeView()
+                    HomeView(userID: authViewModel.currentUser?.uid)
+                case .favorites:
+                    FavoritesView(userID: authViewModel.currentUser?.uid)
                 case .search:
                     SearchView()
                 case .profile:
@@ -39,6 +43,7 @@ struct BottomNavigationBar: View {
 
             HStack(spacing: 0) {
                 navButton(title: "Home", icon: "house.fill", tab: .home)
+                navButton(title: "Favorites", icon: "heart.fill", tab: .favorites)
                 navButton(title: "Search", icon: "magnifyingglass", tab: .search)
                 navButton(title: "Profile", icon: "person.crop.circle", tab: .profile)
             }
