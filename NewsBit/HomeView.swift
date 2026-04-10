@@ -307,9 +307,13 @@
 import SwiftUI
 
 struct HomeView: View {
-    @StateObject private var viewModel = NewsFeedViewModel()
+    @StateObject private var viewModel: NewsFeedViewModel
     @State private var selectedNews: NewsCard?
     @State private var isShowingDetail = false
+
+    init(userID: String? = nil) {
+        _viewModel = StateObject(wrappedValue: NewsFeedViewModel(userID: userID))
+    }
 
     var body: some View {
         NavigationStack {
@@ -342,6 +346,8 @@ struct HomeView: View {
                                 SwipeableNewsCardView(
                                     card: card,
                                     isTopCard: index == viewModel.cards.count - 1,
+                                    isFavorite: viewModel.isFavorite(card),
+                                    isHighlighted: viewModel.isHighlighted(card),
                                     onTap: {
                                         if index == viewModel.cards.count - 1 {
                                             selectedNews = card
@@ -353,6 +359,19 @@ struct HomeView: View {
                                             Task {
                                                 await viewModel.consumeTopCard()
                                             }
+                                        }
+                                    },
+                                    onFavoriteTap: {
+                                        Task {
+                                            await viewModel.toggleFavorite(for: card)
+                                        }
+                                    },
+                                    onCommentTap: {
+                                        // Placeholder action for comment.
+                                    },
+                                    onHighlightTap: {
+                                        Task {
+                                            await viewModel.toggleHighlight(for: card)
                                         }
                                     }
                                 )
@@ -413,8 +432,13 @@ struct HomeView: View {
 struct SwipeableNewsCardView: View {
     let card: NewsCard
     let isTopCard: Bool
+    let isFavorite: Bool
+    let isHighlighted: Bool
     let onTap: () -> Void
     let onSwipe: () -> Void
+    let onFavoriteTap: () -> Void
+    let onCommentTap: () -> Void
+    let onHighlightTap: () -> Void
 
     @State private var offset: CGSize = .zero
 
@@ -424,57 +448,92 @@ struct SwipeableNewsCardView: View {
             let imageHeight = min(max(geometry.size.height * 0.48, 260), 340)
 
             VStack(spacing: 0) {
-                ZStack(alignment: .topTrailing) {
-                    newsImage
-                        .frame(maxWidth: .infinity)
-                        .frame(height: imageHeight)
-                        .clipped()
-                        .overlay(alignment: .bottomLeading) {
-                            Text(card.source)
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 6)
-                                .background(.black.opacity(0.95), in: Capsule())
-                                .padding(14)
-                                .position(x:90,y:320)
-                        }
+                VStack(spacing: 0) {
+                    ZStack(alignment: .topTrailing) {
+                        newsImage
+                            .frame(maxWidth: .infinity)
+                            .frame(height: imageHeight)
+                            .clipped()
+                            .overlay(alignment: .bottomLeading) {
+                                Text(card.source)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.white)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(.black.opacity(0.95), in: Capsule())
+                                    .padding(14)
+                                    .position(x: 90, y: 320)
+                            }
 
-                    Image(systemName: "ellipsis")
-                        .font(.headline)
-                        .foregroundStyle(.white)
-                        .padding(12)
-                        .background(.black.opacity(0.95), in: Circle())
-                        .padding(12)
-                        .position(x:420, y:30)
+                        Image(systemName: "ellipsis")
+                            .font(.headline)
+                            .foregroundStyle(.white)
+                            .padding(12)
+                            .background(.black.opacity(0.95), in: Circle())
+                            .padding(12)
+                            .position(x: 420, y: 30)
+                    }
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text(card.title)
+                            .font(.title3.weight(.bold))
+                            .foregroundStyle(.primary)
+                            .lineLimit(3)
+                            .multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        Text(card.time)
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(.secondary)
+
+                        Text(card.summary)
+                            .font(.body)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(5)
+                            .multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        Spacer(minLength: 0)
+                    }
+                    .padding(16)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .background(Color.white)
+                }
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    if isTopCard {
+                        onTap()
+                    }
                 }
 
-                VStack(alignment: .leading, spacing: 10) {
-                    Text(card.title)
-                        .font(.title3.weight(.bold))
-                        .foregroundStyle(.primary)
-                        .lineLimit(3)
-                        .multilineTextAlignment(.leading)
-                        .fixedSize(horizontal: false, vertical: true)
+                Divider()
 
-                    Text(card.time)
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(.secondary)
-
-                    Text(card.summary)
-                        .font(.body)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(6)
-                        .multilineTextAlignment(.leading)
-                        .fixedSize(horizontal: false, vertical: true)
-
-                    Spacer(minLength: 0)
+                HStack(spacing: 0) {
+                    actionButton(
+                        title: "Favorite",
+                        systemImage: isFavorite ? "heart.fill" : "heart",
+                        isActive: isFavorite,
+                        activeColor: .red,
+                        action: onFavoriteTap
+                    )
+                    actionButton(
+                        title: "Comment",
+                        systemImage: "bubble.right",
+                        action: onCommentTap
+                    )
+                    actionButton(
+                        title: "Highlight",
+                        systemImage: isHighlighted ? "highlighter" : "highlighter",
+                        isActive: isHighlighted,
+                        activeColor: .yellow,
+                        action: onHighlightTap
+                    )
                 }
-                .padding(16)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 10)
                 .background(Color.white)
             }
-            .frame(width: geometry.size.width, height: geometry.size.height*0.97)
+            .frame(width: geometry.size.width, height: geometry.size.height * 0.97)
             .background(Color.white)
             .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
             .overlay(
@@ -485,11 +544,6 @@ struct SwipeableNewsCardView: View {
             .offset(offset)
             .rotationEffect(.degrees(Double(offset.width / 18)))
             .contentShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-            .onTapGesture {
-                if isTopCard {
-                    onTap()
-                }
-            }
             .gesture(isTopCard ? dragGesture : nil)
             .allowsHitTesting(isTopCard)
             .animation(.spring(response: 0.3, dampingFraction: 0.85), value: offset)
@@ -526,6 +580,28 @@ struct SwipeableNewsCardView: View {
                     .font(.system(size: 78, weight: .bold))
                     .foregroundStyle(.white.opacity(0.8))
             }
+    }
+
+    @ViewBuilder
+    private func actionButton(
+        title: String,
+        systemImage: String,
+        isActive: Bool = false,
+        activeColor: Color = .red,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            VStack(spacing: 6) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 17, weight: .semibold))
+                Text(title)
+                    .font(.caption)
+            }
+            .foregroundStyle(isActive ? activeColor : .secondary)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 6)
+        }
+        .buttonStyle(.plain)
     }
 
     private var dragGesture: some Gesture {
