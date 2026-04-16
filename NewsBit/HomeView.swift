@@ -336,7 +336,8 @@ struct HomeView: View {
                 let availableCardHeight = max(0, availableContentHeight - categoryBarHeight - contentSpacing)
                 let stackSpacing: CGFloat = 8
                 let visibleStackDepth = 2
-                let stackLift = CGFloat(visibleStackDepth) * stackSpacing
+                let visibleCards = viewModel.visibleCards(maxCount: visibleStackDepth + 1)
+                let stackLift = CGFloat(max(visibleCards.count - 1, 0)) * stackSpacing
                 let preferredCardAspectRatio = isLandscape
                     ? min(max(screenAspectRatio * 0.85, 0.95), 1.35)
                     : min(max(screenAspectRatio * 1.08, 0.50), 0.68)
@@ -360,26 +361,31 @@ struct HomeView: View {
                         categoryBar(height: categoryBarHeight)
 
                         ZStack {
-                            ForEach(Array(viewModel.cards.enumerated()), id: \.element.id) { index, card in
-                                let depth = min(max(viewModel.cards.count - 1 - index, 0), visibleStackDepth)
+                            ForEach(Array(visibleCards.enumerated().reversed()), id: \.element.id) { entry in
+                                let relativeIndex = entry.offset
+                                let card = entry.element
+                                let isTopCard = relativeIndex == 0
 
                                 SwipeableNewsCardView(
                                     card: card,
-                                    isTopCard: index == viewModel.cards.count - 1,
+                                    isTopCard: isTopCard,
+                                    canSwipeForward: isTopCard && viewModel.canAdvance,
+                                    canSwipeBackward: isTopCard && viewModel.canRewind,
                                     isFavorite: viewModel.isFavorite(card),
                                     isHighlighted: viewModel.isHighlighted(card),
                                     onTap: {
-                                        if index == viewModel.cards.count - 1 {
+                                        if isTopCard {
                                             selectedNews = card
                                             isShowingDetail = true
                                         }
                                     },
-                                    onSwipe: {
-                                        if index == viewModel.cards.count - 1 {
-                                            Task {
-                                                await viewModel.consumeTopCard()
-                                            }
+                                    onSwipeForward: {
+                                        Task {
+                                            await viewModel.advanceToNextCard()
                                         }
+                                    },
+                                    onSwipeBackward: {
+                                        viewModel.returnToPreviousCard()
                                     },
                                     onFavoriteTap: {
                                         Task {
@@ -395,15 +401,16 @@ struct HomeView: View {
                                         }
                                     },
                                     onShareSwipe: {
-                                        if index == viewModel.cards.count - 1 {
+                                        if isTopCard {
                                             activeSheet = .share(card)
                                         }
                                     }
                                 )
                                 .frame(width: cardWidth)
                                 .frame(height: cardHeight)
-                                .offset(y: CGFloat(depth) * stackSpacing)
-                                .zIndex(Double(index))
+                                .offset(y: CGFloat(relativeIndex) * stackSpacing)
+                                .scaleEffect(1 - (CGFloat(relativeIndex) * 0.02), anchor: .top)
+                                .zIndex(Double(visibleCards.count - relativeIndex))
                             }
 
                             if viewModel.cards.isEmpty {
@@ -560,10 +567,13 @@ private enum ActiveSheet: Identifiable {
 struct SwipeableNewsCardView: View {
     let card: NewsCard
     let isTopCard: Bool
+    let canSwipeForward: Bool
+    let canSwipeBackward: Bool
     let isFavorite: Bool
     let isHighlighted: Bool
     let onTap: () -> Void
-    let onSwipe: () -> Void
+    let onSwipeForward: () -> Void
+    let onSwipeBackward: () -> Void
     let onFavoriteTap: () -> Void
     let onCommentTap: () -> Void
     let onHighlightTap: () -> Void
@@ -735,6 +745,7 @@ struct SwipeableNewsCardView: View {
                 let height = value.translation.height
                 let threshold: CGFloat = 110
                 let isShareSwipe = height < -threshold && abs(height) > abs(width) * 1.1
+                let isHorizontalSwipe = abs(width) > threshold && abs(width) > abs(height)
 
                 if isShareSwipe {
                     withAnimation(.spring(response: 0.24, dampingFraction: 0.8)) {
@@ -750,20 +761,31 @@ struct SwipeableNewsCardView: View {
                     return
                 }
 
-                if abs(width) > threshold || abs(height) > threshold {
-                    let swipeX = width == 0 ? 0 : (width > 0 ? 900 : -900)
-                    let swipeY = height == 0 ? 0 : (height > 0 ? 900 : -900)
-
+                if isHorizontalSwipe, width < 0, canSwipeForward {
                     withAnimation(.easeIn(duration: 0.22)) {
-                        offset = CGSize(width: swipeX, height: swipeY)
+                        offset = CGSize(width: -900, height: min(height * 0.2, 80))
                     }
 
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                        onSwipe()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+                        onSwipeForward()
+                        offset = .zero
                     }
-                } else {
-                    offset = .zero
+                    return
                 }
+
+                if isHorizontalSwipe, width > 0, canSwipeBackward {
+                    withAnimation(.easeIn(duration: 0.22)) {
+                        offset = CGSize(width: 900, height: min(height * 0.2, 80))
+                    }
+
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+                        onSwipeBackward()
+                        offset = .zero
+                    }
+                    return
+                }
+
+                offset = .zero
             }
     }
 
@@ -833,69 +855,419 @@ struct NewsDetailView: View {
     let card: NewsCard
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: 0) {
-                ZStack(alignment: .bottomLeading) {
-                    if let imageURL = card.imageURL {
-                        AsyncImage(url: imageURL) { phase in
-                            switch phase {
-                            case .success(let image):
-                                image
-                                    .resizable()
-                                    .scaledToFill()
-                            default:
-                                placeholderHero
-                            }
-                        }
-                    } else {
-                        placeholderHero
+        GeometryReader { geometry in
+            let layout = layoutMetrics(
+                for: geometry.size,
+                safeAreaInsets: geometry.safeAreaInsets
+            )
+
+            ScrollView(showsIndicators: false) {
+                VStack(spacing: 0) {
+                    heroSection(layout: layout)
+                        .frame(maxWidth: layout.contentMaxWidth)
+                        .frame(maxWidth: .infinity)
+
+                    VStack(alignment: .leading, spacing: layout.sectionSpacing) {
+                        headlineCard(layout: layout)
+                        summaryCard(layout: layout)
+                        bodyCard(layout: layout)
                     }
-
-                    Text(card.source)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .background(.black.opacity(0.55), in: Capsule())
-                        .padding(16)
+                    .frame(maxWidth: layout.contentMaxWidth)
+                    .padding(.horizontal, layout.outerHorizontalPadding)
+                    .padding(.top, -layout.heroOverlap)
+                    .padding(.bottom, layout.bottomPadding)
+                    .frame(maxWidth: .infinity)
                 }
-                .frame(height: 300)
-                .clipped()
-
-                VStack(alignment: .leading, spacing: 14) {
-                    Text(card.title)
-                        .font(.title2.weight(.bold))
-
-                    Text(card.time)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-
-                    Text(card.summary)
-                        .font(.body.weight(.semibold))
-                        .padding(.top, 4)
-
-                    Text(card.fullText)
-                        .font(.body)
-                        .foregroundStyle(.primary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .padding(.horizontal,50)
-                .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .background(
+                LinearGradient(
+                    colors: [
+                        Color(.systemGroupedBackground),
+                        Color(.systemBackground)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+                .ignoresSafeArea()
+            )
+            .navigationTitle("Article")
+            .navigationBarTitleDisplayMode(.inline)
         }
-        .background(Color(.systemBackground))
-        .navigationTitle("News")
-        .navigationBarTitleDisplayMode(.inline)
     }
 
-    private var placeholderHero: some View {
+    private func heroSection(layout: DetailLayoutMetrics) -> some View {
+        ZStack(alignment: .bottomLeading) {
+            heroMedia(layout: layout)
+
+            LinearGradient(
+                colors: [
+                    Color.clear,
+                    Color.black.opacity(0.14),
+                    Color.black.opacity(0.72)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+
+            VStack(alignment: .leading, spacing: layout.heroMetaSpacing) {
+                HStack(spacing: layout.heroPillSpacing) {
+                    heroPill(title: card.source, systemImage: "newspaper.fill", layout: layout)
+                    heroPill(title: readingTimeText, systemImage: "clock.fill", layout: layout)
+                }
+
+                Text(card.time)
+                    .font(.system(size: layout.heroTimeFontSize, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.92))
+            }
+            .padding(.horizontal, layout.heroOverlayHorizontalPadding)
+            .padding(.bottom, layout.heroOverlayBottomPadding)
+        }
+        .frame(height: layout.heroHeight)
+        .clipShape(
+            RoundedRectangle(cornerRadius: layout.heroCornerRadius, style: .continuous)
+        )
+        .padding(.horizontal, layout.outerHorizontalPadding)
+        .padding(.top, layout.heroTopPadding)
+    }
+
+    private func heroMedia(layout: DetailLayoutMetrics) -> some View {
+        Group {
+            if let imageURL = card.imageURL {
+                AsyncImage(url: imageURL) { phase in
+                    switch phase {
+                    case .success(let image):
+                        image
+                            .resizable()
+                            .scaledToFill()
+                    default:
+                        placeholderHero(layout: layout)
+                    }
+                }
+            } else {
+                placeholderHero(layout: layout)
+            }
+        }
+    }
+
+    private func headlineCard(layout: DetailLayoutMetrics) -> some View {
+        VStack(alignment: .leading, spacing: layout.headlineSpacing) {
+            Text("FEATURED REPORT")
+                .font(.system(size: layout.eyebrowFontSize, weight: .bold))
+                .tracking(layout.eyebrowTracking)
+                .foregroundStyle(Color.blue)
+
+            Text(card.title)
+                .font(.system(size: layout.titleFontSize, weight: .bold, design: .default))
+                .foregroundStyle(.primary)
+                .multilineTextAlignment(.leading)
+
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: layout.detailPillSpacing) {
+                    detailPill(title: "Full story", systemImage: "doc.text.fill", layout: layout)
+                    detailPill(
+                        title: card.commentCount > 0 ? "\(card.commentCount) comments" : "Discussion open",
+                        systemImage: "bubble.right.fill",
+                        layout: layout
+                    )
+                }
+
+                VStack(alignment: .leading, spacing: layout.detailPillSpacing) {
+                    detailPill(title: "Full story", systemImage: "doc.text.fill", layout: layout)
+                    detailPill(
+                        title: card.commentCount > 0 ? "\(card.commentCount) comments" : "Discussion open",
+                        systemImage: "bubble.right.fill",
+                        layout: layout
+                    )
+                }
+            }
+        }
+        .padding(layout.cardPadding)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(detailCardBackground(layout: layout))
+    }
+
+    private func summaryCard(layout: DetailLayoutMetrics) -> some View {
+        VStack(alignment: .leading, spacing: layout.summarySpacing) {
+            Text("In Brief")
+                .font(.system(size: layout.summaryLabelFontSize, weight: .semibold))
+                .foregroundStyle(.secondary)
+
+            Text(card.summary)
+                .font(.system(size: layout.summaryFontSize, weight: .semibold))
+                .foregroundStyle(.primary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(layout.summaryPadding)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: layout.summaryCornerRadius, style: .continuous)
+                .fill(Color.blue.opacity(0.08))
+                .overlay(
+                    RoundedRectangle(cornerRadius: layout.summaryCornerRadius, style: .continuous)
+                        .stroke(Color.blue.opacity(0.12), lineWidth: 1)
+                )
+        )
+        .overlay(alignment: .leading) {
+            Capsule(style: .continuous)
+                .fill(Color.blue)
+                .frame(width: 4, height: 54)
+                .frame(height: layout.summaryAccentHeight)
+                .padding(.leading, layout.summaryAccentLeadingPadding)
+        }
+    }
+
+    private func bodyCard(layout: DetailLayoutMetrics) -> some View {
+        VStack(alignment: .leading, spacing: layout.bodySpacing) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Full Story")
+                        .font(.system(size: layout.bodyHeadingFontSize, weight: .bold))
+
+                    Text("Source: \(card.source)")
+                        .font(.system(size: layout.bodyMetaFontSize, weight: .regular))
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+            }
+
+            Divider()
+
+            Text(card.fullText)
+                .font(.system(size: layout.bodyFontSize, weight: .regular, design: .serif))
+                .lineSpacing(layout.bodyLineSpacing)
+                .foregroundStyle(Color.primary.opacity(0.92))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(layout.cardPadding)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(detailCardBackground(layout: layout))
+    }
+
+    private func detailCardBackground(layout: DetailLayoutMetrics) -> some View {
+        RoundedRectangle(cornerRadius: layout.cardCornerRadius, style: .continuous)
+            .fill(Color(.systemBackground))
+            .shadow(color: .black.opacity(0.08), radius: layout.shadowRadius, x: 0, y: layout.shadowYOffset)
+            .overlay(
+                RoundedRectangle(cornerRadius: layout.cardCornerRadius, style: .continuous)
+                    .stroke(Color.black.opacity(0.05), lineWidth: 1)
+            )
+    }
+
+    private func heroPill(title: String, systemImage: String, layout: DetailLayoutMetrics) -> some View {
+        Label(title, systemImage: systemImage)
+            .font(.system(size: layout.heroPillFontSize, weight: .semibold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, layout.heroPillHorizontalPadding)
+            .padding(.vertical, layout.heroPillVerticalPadding)
+            .background(.ultraThinMaterial, in: Capsule())
+    }
+
+    private func detailPill(title: String, systemImage: String, layout: DetailLayoutMetrics) -> some View {
+        Label(title, systemImage: systemImage)
+            .font(.system(size: layout.detailPillFontSize, weight: .semibold))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, layout.detailPillHorizontalPadding)
+            .padding(.vertical, layout.detailPillVerticalPadding)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(Color(.secondarySystemBackground))
+            )
+    }
+
+    private var readingTimeText: String {
+        let text = [card.summary, card.fullText]
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let wordCount = text.split { $0.isWhitespace || $0.isNewline }.count
+        let minutes = max(1, Int(ceil(Double(wordCount) / 180.0)))
+        return "\(minutes) min read"
+    }
+
+    private func placeholderHero(layout: DetailLayoutMetrics) -> some View {
         Rectangle()
             .fill(card.imageGradient)
             .overlay {
-                Image(systemName: card.thumbnailSymbol)
-                    .font(.system(size: 96, weight: .bold))
-                    .foregroundStyle(.white.opacity(0.8))
+                ZStack {
+                    Circle()
+                        .fill(.white.opacity(0.12))
+                        .frame(width: layout.placeholderLargeCircleSize, height: layout.placeholderLargeCircleSize)
+                        .offset(x: layout.placeholderLargeCircleOffset.width, y: layout.placeholderLargeCircleOffset.height)
+
+                    Circle()
+                        .fill(.white.opacity(0.08))
+                        .frame(width: layout.placeholderSmallCircleSize, height: layout.placeholderSmallCircleSize)
+                        .offset(x: layout.placeholderSmallCircleOffset.width, y: layout.placeholderSmallCircleOffset.height)
+
+                    Image(systemName: card.thumbnailSymbol)
+                        .font(.system(size: layout.placeholderIconSize, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.84))
+                }
             }
+    }
+
+    private func layoutMetrics(for size: CGSize, safeAreaInsets: EdgeInsets) -> DetailLayoutMetrics {
+        let width = size.width.isFinite ? max(size.width, 1) : 1
+        let height = size.height.isFinite ? max(size.height, 1) : 1
+        let aspectRatio = width / height
+        let isLandscape = aspectRatio > 1
+        let isCompactWidth = width < 390
+        let isCompactHeight = height < 720
+
+        let outerHorizontalPadding = max(min(width * 0.045, 24), 12)
+        let availableContentWidth = max(width - (outerHorizontalPadding * 2), 1)
+        let contentMaxWidth = min(availableContentWidth, isLandscape ? 760 : 680)
+        let heroHeightBase = isLandscape ? height * 0.48 : width * 0.92
+        let heroHeight = min(
+            max(heroHeightBase, isCompactHeight ? 220 : 270),
+            isLandscape ? 340 : 430
+        )
+        let heroCornerRadius = isCompactWidth ? 24.0 : 30.0
+        let heroTopPadding = isCompactHeight ? 8.0 : 10.0
+        let heroOverlayHorizontalPadding = isCompactWidth ? 16.0 : 20.0
+        let heroOverlayBottomPadding = isCompactHeight ? 18.0 : 24.0
+        let heroPillFontSize = isCompactWidth ? 11.0 : 12.0
+        let heroPillHorizontalPadding = isCompactWidth ? 10.0 : 12.0
+        let heroPillVerticalPadding = isCompactWidth ? 7.0 : 8.0
+        let heroPillSpacing = isCompactWidth ? 6.0 : 8.0
+        let heroMetaSpacing = isCompactWidth ? 10.0 : 12.0
+        let heroTimeFontSize = isCompactWidth ? 12.0 : 13.0
+        let heroOverlap = min(max(heroHeight * 0.1, 22), 40)
+        let sectionSpacing = isCompactHeight ? 14.0 : 18.0
+        let cardPadding = isCompactWidth ? 18.0 : 22.0
+        let cardCornerRadius = isCompactWidth ? 24.0 : 28.0
+        let shadowRadius = isCompactWidth ? 12.0 : 16.0
+        let shadowYOffset = isCompactWidth ? 6.0 : 8.0
+        let eyebrowFontSize = isCompactWidth ? 11.0 : 12.0
+        let eyebrowTracking = isCompactWidth ? 1.2 : 1.4
+        let titleFontSize = min(
+            max(width * (isLandscape ? 0.042 : 0.072), isCompactWidth ? 24.0 : 27.0),
+            isLandscape ? 32.0 : 36.0
+        )
+        let headlineSpacing = isCompactHeight ? 14.0 : 16.0
+        let detailPillFontSize = isCompactWidth ? 11.0 : 12.0
+        let detailPillHorizontalPadding = isCompactWidth ? 10.0 : 12.0
+        let detailPillVerticalPadding = isCompactWidth ? 7.0 : 8.0
+        let detailPillSpacing = isCompactWidth ? 8.0 : 10.0
+        let summarySpacing = isCompactHeight ? 8.0 : 10.0
+        let summaryPadding = isCompactWidth ? 18.0 : 20.0
+        let summaryCornerRadius = isCompactWidth ? 20.0 : 24.0
+        let summaryLabelFontSize = isCompactWidth ? 14.0 : 15.0
+        let summaryFontSize = isCompactWidth ? 16.0 : (isLandscape ? 16.5 : 17.5)
+        let summaryAccentHeight = isCompactHeight ? 44.0 : 54.0
+        let summaryAccentLeadingPadding = isCompactWidth ? 10.0 : 12.0
+        let bodySpacing = isCompactHeight ? 14.0 : 18.0
+        let bodyHeadingFontSize = isCompactWidth ? 18.0 : 20.0
+        let bodyMetaFontSize = isCompactWidth ? 14.0 : 15.0
+        let bodyFontSize = min(max(width * 0.045, 17.0), isLandscape ? 18.0 : 19.0)
+        let bodyLineSpacing = isCompactWidth ? 6.0 : 8.0
+        let bottomPadding = max(24.0, safeAreaInsets.bottom + 18.0)
+        let placeholderLargeCircleSize = min(max(heroHeight * 0.56, 150.0), 220.0)
+        let placeholderSmallCircleSize = min(max(heroHeight * 0.4, 108.0), 160.0)
+        let placeholderIconSize = min(max(heroHeight * 0.27, 72.0), 108.0)
+
+        return DetailLayoutMetrics(
+            outerHorizontalPadding: outerHorizontalPadding,
+            contentMaxWidth: contentMaxWidth,
+            sectionSpacing: sectionSpacing,
+            bottomPadding: bottomPadding,
+            heroHeight: heroHeight,
+            heroCornerRadius: heroCornerRadius,
+            heroTopPadding: heroTopPadding,
+            heroOverlayHorizontalPadding: heroOverlayHorizontalPadding,
+            heroOverlayBottomPadding: heroOverlayBottomPadding,
+            heroPillFontSize: heroPillFontSize,
+            heroPillHorizontalPadding: heroPillHorizontalPadding,
+            heroPillVerticalPadding: heroPillVerticalPadding,
+            heroPillSpacing: heroPillSpacing,
+            heroMetaSpacing: heroMetaSpacing,
+            heroTimeFontSize: heroTimeFontSize,
+            heroOverlap: heroOverlap,
+            cardPadding: cardPadding,
+            cardCornerRadius: cardCornerRadius,
+            shadowRadius: shadowRadius,
+            shadowYOffset: shadowYOffset,
+            eyebrowFontSize: eyebrowFontSize,
+            eyebrowTracking: eyebrowTracking,
+            titleFontSize: titleFontSize,
+            headlineSpacing: headlineSpacing,
+            detailPillFontSize: detailPillFontSize,
+            detailPillHorizontalPadding: detailPillHorizontalPadding,
+            detailPillVerticalPadding: detailPillVerticalPadding,
+            detailPillSpacing: detailPillSpacing,
+            summarySpacing: summarySpacing,
+            summaryPadding: summaryPadding,
+            summaryCornerRadius: summaryCornerRadius,
+            summaryLabelFontSize: summaryLabelFontSize,
+            summaryFontSize: summaryFontSize,
+            summaryAccentHeight: summaryAccentHeight,
+            summaryAccentLeadingPadding: summaryAccentLeadingPadding,
+            bodySpacing: bodySpacing,
+            bodyHeadingFontSize: bodyHeadingFontSize,
+            bodyMetaFontSize: bodyMetaFontSize,
+            bodyFontSize: bodyFontSize,
+            bodyLineSpacing: bodyLineSpacing,
+            placeholderLargeCircleSize: placeholderLargeCircleSize,
+            placeholderLargeCircleOffset: CGSize(
+                width: placeholderLargeCircleSize * 0.44,
+                height: -(placeholderLargeCircleSize * 0.26)
+            ),
+            placeholderSmallCircleSize: placeholderSmallCircleSize,
+            placeholderSmallCircleOffset: CGSize(
+                width: -(placeholderSmallCircleSize * 0.7),
+                height: placeholderSmallCircleSize * 0.62
+            ),
+            placeholderIconSize: placeholderIconSize
+        )
+    }
+
+    private struct DetailLayoutMetrics {
+        let outerHorizontalPadding: CGFloat
+        let contentMaxWidth: CGFloat
+        let sectionSpacing: CGFloat
+        let bottomPadding: CGFloat
+        let heroHeight: CGFloat
+        let heroCornerRadius: CGFloat
+        let heroTopPadding: CGFloat
+        let heroOverlayHorizontalPadding: CGFloat
+        let heroOverlayBottomPadding: CGFloat
+        let heroPillFontSize: CGFloat
+        let heroPillHorizontalPadding: CGFloat
+        let heroPillVerticalPadding: CGFloat
+        let heroPillSpacing: CGFloat
+        let heroMetaSpacing: CGFloat
+        let heroTimeFontSize: CGFloat
+        let heroOverlap: CGFloat
+        let cardPadding: CGFloat
+        let cardCornerRadius: CGFloat
+        let shadowRadius: CGFloat
+        let shadowYOffset: CGFloat
+        let eyebrowFontSize: CGFloat
+        let eyebrowTracking: CGFloat
+        let titleFontSize: CGFloat
+        let headlineSpacing: CGFloat
+        let detailPillFontSize: CGFloat
+        let detailPillHorizontalPadding: CGFloat
+        let detailPillVerticalPadding: CGFloat
+        let detailPillSpacing: CGFloat
+        let summarySpacing: CGFloat
+        let summaryPadding: CGFloat
+        let summaryCornerRadius: CGFloat
+        let summaryLabelFontSize: CGFloat
+        let summaryFontSize: CGFloat
+        let summaryAccentHeight: CGFloat
+        let summaryAccentLeadingPadding: CGFloat
+        let bodySpacing: CGFloat
+        let bodyHeadingFontSize: CGFloat
+        let bodyMetaFontSize: CGFloat
+        let bodyFontSize: CGFloat
+        let bodyLineSpacing: CGFloat
+        let placeholderLargeCircleSize: CGFloat
+        let placeholderLargeCircleOffset: CGSize
+        let placeholderSmallCircleSize: CGFloat
+        let placeholderSmallCircleOffset: CGSize
+        let placeholderIconSize: CGFloat
     }
 }
 private struct NewsCommentsSheet: View {

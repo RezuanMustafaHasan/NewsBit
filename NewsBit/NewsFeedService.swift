@@ -49,6 +49,7 @@ struct NewsCategoryFilter: Identifiable, Hashable {
 @MainActor
 final class NewsFeedViewModel: ObservableObject {
     @Published private(set) var cards: [NewsCard] = []
+    @Published private(set) var currentCardIndex = 0
     @Published private(set) var isLoading = false
     @Published var loadError: String?
     @Published private(set) var favoriteCardIDs: Set<String> = []
@@ -86,24 +87,48 @@ final class NewsFeedViewModel: ObservableObject {
         requestGeneration += 1
         let generation = requestGeneration
         cards = []
+        currentCardIndex = 0
         nextPage = 0
         reachedEnd = false
         loadError = nil
         favoriteCardIDs.removeAll()
         highlightedCardIDs.removeAll()
-        await fetchNextPage(prepend: true, generation: generation)
+        await fetchNextPage(generation: generation)
     }
 
-    func consumeTopCard() async {
+    var canAdvance: Bool {
+        currentCardIndex + 1 < cards.count
+    }
+
+    var canRewind: Bool {
+        currentCardIndex > 0
+    }
+
+    func visibleCards(maxCount: Int) -> [NewsCard] {
+        guard !cards.isEmpty, maxCount > 0 else { return [] }
+
+        let safeIndex = min(max(currentCardIndex, 0), cards.count - 1)
+        let endIndex = min(cards.count, safeIndex + maxCount)
+        return Array(cards[safeIndex..<endIndex])
+    }
+
+    func advanceToNextCard() async {
         guard !cards.isEmpty else { return }
 
-        cards.removeLast()
-
-        guard cards.count <= prefetchThreshold, !reachedEnd, !isLoading else {
+        if currentCardIndex + 1 < cards.count {
+            currentCardIndex += 1
+            await prefetchIfNeeded()
             return
         }
 
-        await fetchNextPage(prepend: true, generation: requestGeneration)
+        if !reachedEnd {
+            await prefetchIfNeeded()
+        }
+    }
+
+    func returnToPreviousCard() {
+        guard currentCardIndex > 0 else { return }
+        currentCardIndex -= 1
     }
 
     func selectCategory(_ category: NewsCategoryFilter) async {
@@ -194,7 +219,13 @@ final class NewsFeedViewModel: ObservableObject {
         }
     }
 
-    private func fetchNextPage(prepend: Bool, generation: Int) async {
+    private func prefetchIfNeeded() async {
+        let remainingCards = cards.count - (currentCardIndex + 1)
+        guard remainingCards <= prefetchThreshold, !reachedEnd else { return }
+        await fetchNextPage(generation: requestGeneration)
+    }
+
+    private func fetchNextPage(generation: Int) async {
         guard !reachedEnd else { return }
         guard !(activeRequestCount > 0 && generation == requestGeneration) else { return }
 
@@ -229,11 +260,7 @@ final class NewsFeedViewModel: ObservableObject {
                 reachedEnd = true
             }
 
-            if prepend {
-                cards.insert(contentsOf: mappedCards, at: 0)
-            } else {
-                cards.append(contentsOf: mappedCards)
-            }
+            cards.append(contentsOf: mappedCards)
 
             nextPage += 1
             loadError = nil
