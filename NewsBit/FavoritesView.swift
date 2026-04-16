@@ -7,6 +7,8 @@ struct FavoritesView: View {
     @StateObject private var viewModel: FavoritesViewModel
     @State private var selectedCard: NewsCard?
     @State private var isShowingDetail = false
+    @State private var pendingUndoItem: FavoriteNewsItem?
+    @State private var undoDismissTask: Task<Void, Never>?
 
     init(userID: String?) {
         _viewModel = StateObject(wrappedValue: FavoritesViewModel(userID: userID))
@@ -50,7 +52,10 @@ struct FavoritesView: View {
                                 }
                             ) {
                                 Task {
-                                    await viewModel.unfavorite(itemID: item.id)
+                                    let didUnfavorite = await viewModel.unfavorite(item: item)
+                                    if didUnfavorite {
+                                        showUndo(for: item)
+                                    }
                                 }
                             }
                         }
@@ -71,6 +76,46 @@ struct FavoritesView: View {
                 await viewModel.loadFavorites()
             }
         }
+        .overlay(alignment: .bottomTrailing) {
+            if let pendingUndoItem {
+                Button("Undo") {
+                    Task {
+                        let restored = await viewModel.restoreFavorite(item: pendingUndoItem)
+                        if restored {
+                            hideUndo()
+                        }
+                    }
+                }
+                .font(.subheadline.weight(.semibold))
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(.black.opacity(0.82), in: Capsule())
+                .foregroundStyle(.white)
+                .padding(.trailing, 16)
+                .padding(.bottom, 22)
+                .transition(.move(edge: .trailing).combined(with: .opacity))
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: pendingUndoItem?.id)
+    }
+
+    private func showUndo(for item: FavoriteNewsItem) {
+        undoDismissTask?.cancel()
+        pendingUndoItem = item
+        undoDismissTask = Task {
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            if !Task.isCancelled {
+                await MainActor.run {
+                    hideUndo()
+                }
+            }
+        }
+    }
+
+    private func hideUndo() {
+        undoDismissTask?.cancel()
+        undoDismissTask = nil
+        pendingUndoItem = nil
     }
 }
 
@@ -238,20 +283,54 @@ final class FavoritesViewModel: ObservableObject {
         }
     }
 
-    func unfavorite(itemID: String) async {
-        guard let userID, !userID.isEmpty else { return }
-        let entryID = "\(userID)_\(itemID)"
+    func unfavorite(item: FavoriteNewsItem) async -> Bool {
+        guard let userID, !userID.isEmpty else { return false }
+        let entryID = "\(userID)_\(item.id)"
 
         let originalItems = items
-        items.removeAll { $0.id == itemID }
+        items.removeAll { $0.id == item.id }
 
         do {
             try await db.collection("favorites")
                 .document(entryID)
                 .delete()
+            return true
         } catch {
             items = originalItems
             errorMessage = "Unable to remove favorite right now."
+            return false
+        }
+    }
+
+    func restoreFavorite(item: FavoriteNewsItem) async -> Bool {
+        guard let userID, !userID.isEmpty else { return false }
+        let entryID = "\(userID)_\(item.id)"
+
+        do {
+            try await db.collection("favorites")
+                .document(entryID)
+                .setData([
+                    "entryId": entryID,
+                    "userID": userID,
+                    "newsId": item.id,
+                    "title": item.title,
+                    "source": item.source,
+                    "timeText": item.timeText,
+                    "summary": item.summary,
+                    "fullText": item.fullText,
+                    "thumbnailSymbol": item.thumbnailSymbol,
+                    "imageURL": item.imageURL?.absoluteString ?? "",
+                    "savedAt": Timestamp(date: item.date)
+                ], merge: true)
+
+            if !items.contains(where: { $0.id == item.id }) {
+                items.append(item)
+                items.sort { $0.date > $1.date }
+            }
+            return true
+        } catch {
+            errorMessage = "Unable to restore favorite right now."
+            return false
         }
     }
 

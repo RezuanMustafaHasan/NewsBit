@@ -137,7 +137,8 @@ final class AuthViewModel: ObservableObject {
                 username: cleanedUsername,
                 email: cleanedEmail,
                 gender: gender,
-                avatarColorHex: defaultAvatarColorHex(for: gender)
+                avatarColorHex: defaultAvatarColorHex(for: gender),
+                avatarImageBase64: nil
             )
 
             currentUser = authResult.user
@@ -189,7 +190,8 @@ final class AuthViewModel: ObservableObject {
                 email: data["email"] as? String ?? currentUser?.email ?? "",
                 gender: gender,
                 createdAt: createdAt,
-                avatarColorHex: data["avatarColorHex"] as? String ?? defaultAvatarColorHex(for: gender)
+                avatarColorHex: data["avatarColorHex"] as? String ?? defaultAvatarColorHex(for: gender),
+                avatarImageBase64: data["avatarImageBase64"] as? String
             )
         } catch {
             let nsError = error as NSError
@@ -205,6 +207,39 @@ final class AuthViewModel: ObservableObject {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 firestore.collection("users").document(uid).setData([
                     "avatarColorHex": hex,
+                    "updatedAt": FieldValue.serverTimestamp()
+                ], merge: true) { error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume()
+                    }
+                }
+            }
+
+            await fetchProfile()
+        } catch {
+            authError = mapError(error)
+        }
+    }
+
+    func updateProfilePhoto(with imageData: Data) async {
+        guard usesFirebase else { return }
+        guard let uid = currentUser?.uid else { return }
+
+        authError = nil
+
+        guard let preparedData = AvatarImageCodec.preparedJPEGData(from: imageData) else {
+            authError = "Unable to process the selected photo."
+            return
+        }
+
+        let base64 = preparedData.base64EncodedString()
+
+        do {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                firestore.collection("users").document(uid).setData([
+                    "avatarImageBase64": base64,
                     "updatedAt": FieldValue.serverTimestamp()
                 ], merge: true) { error in
                     if let error {
@@ -274,16 +309,29 @@ final class AuthViewModel: ObservableObject {
         }
     }
 
-    private func saveUserProfile(uid: String, username: String, email: String, gender: String, avatarColorHex: String) async throws {
+    private func saveUserProfile(
+        uid: String,
+        username: String,
+        email: String,
+        gender: String,
+        avatarColorHex: String,
+        avatarImageBase64: String?
+    ) async throws {
+        var data: [String: Any] = [
+            "uid": uid,
+            "username": username,
+            "email": email,
+            "gender": gender,
+            "avatarColorHex": avatarColorHex,
+            "createdAt": FieldValue.serverTimestamp()
+        ]
+
+        if let avatarImageBase64, !avatarImageBase64.isEmpty {
+            data["avatarImageBase64"] = avatarImageBase64
+        }
+
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            firestore.collection("users").document(uid).setData([
-                "uid": uid,
-                "username": username,
-                "email": email,
-                "gender": gender,
-                "avatarColorHex": avatarColorHex,
-                "createdAt": FieldValue.serverTimestamp()
-            ]) { error in
+            firestore.collection("users").document(uid).setData(data) { error in
                 if let error {
                     continuation.resume(throwing: error)
                 } else {
@@ -462,6 +510,7 @@ struct UserProfile {
     let gender: String
     let createdAt: Date?
     let avatarColorHex: String
+    let avatarImageBase64: String?
 }
 
 enum AuthFlowError: LocalizedError {

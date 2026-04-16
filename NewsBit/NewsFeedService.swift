@@ -16,6 +16,36 @@ struct NewsCard: Identifiable {
     let imageGradient: LinearGradient
 }
 
+struct NewsCategoryFilter: Identifiable, Hashable {
+    let code: String?
+    let label: String
+
+    var id: String {
+        code ?? "ALL"
+    }
+
+    var apiCode: String? {
+        code
+    }
+
+    var isAll: Bool {
+        code == nil
+    }
+
+    static let all = NewsCategoryFilter(code: nil, label: "All")
+
+    static let defaultTabs: [NewsCategoryFilter] = [
+        .all,
+        NewsCategoryFilter(code: "TOP", label: "Top"),
+        NewsCategoryFilter(code: "POLITICS", label: "Politics"),
+        NewsCategoryFilter(code: "WORLD", label: "World"),
+        NewsCategoryFilter(code: "TECHNOLOGY", label: "Technology"),
+        NewsCategoryFilter(code: "SPORTS", label: "Sports"),
+        NewsCategoryFilter(code: "BUSINESS", label: "Business"),
+        NewsCategoryFilter(code: "HEALTH", label: "Health")
+    ]
+}
+
 @MainActor
 final class NewsFeedViewModel: ObservableObject {
     @Published private(set) var cards: [NewsCard] = []
@@ -23,6 +53,8 @@ final class NewsFeedViewModel: ObservableObject {
     @Published var loadError: String?
     @Published private(set) var favoriteCardIDs: Set<String> = []
     @Published private(set) var highlightedCardIDs: Set<String> = []
+    @Published private(set) var categories: [NewsCategoryFilter] = NewsCategoryFilter.defaultTabs
+    @Published private(set) var selectedCategory: NewsCategoryFilter = .all
 
     private let service: NewsFeedService
     private let interactionStore: NewsInteractionStore?
@@ -31,6 +63,9 @@ final class NewsFeedViewModel: ObservableObject {
 
     private var nextPage = 0
     private var reachedEnd = false
+    private var didLoadCategories = false
+    private var requestGeneration = 0
+    private var activeRequestCount = 0
 
     init(userID: String? = nil) {
         self.service = NewsFeedService()
@@ -42,18 +77,21 @@ final class NewsFeedViewModel: ObservableObject {
     }
 
     func loadInitialIfNeeded() async {
+        await loadCategoriesIfNeeded()
         guard cards.isEmpty else { return }
         await refresh()
     }
 
     func refresh() async {
+        requestGeneration += 1
+        let generation = requestGeneration
         cards = []
         nextPage = 0
         reachedEnd = false
         loadError = nil
         favoriteCardIDs.removeAll()
         highlightedCardIDs.removeAll()
-        await fetchNextPage(prepend: true)
+        await fetchNextPage(prepend: true, generation: generation)
     }
 
     func consumeTopCard() async {
@@ -65,7 +103,13 @@ final class NewsFeedViewModel: ObservableObject {
             return
         }
 
-        await fetchNextPage(prepend: true)
+        await fetchNextPage(prepend: true, generation: requestGeneration)
+    }
+
+    func selectCategory(_ category: NewsCategoryFilter) async {
+        guard selectedCategory != category else { return }
+        selectedCategory = category
+        await refresh()
     }
 
     func isFavorite(_ card: NewsCard) -> Bool {
@@ -130,16 +174,55 @@ final class NewsFeedViewModel: ObservableObject {
         }
     }
 
-    private func fetchNextPage(prepend: Bool) async {
-        guard !isLoading, !reachedEnd else { return }
-
-        isLoading = true
-        defer { isLoading = false }
+    private func loadCategoriesIfNeeded() async {
+        guard !didLoadCategories else { return }
+        didLoadCategories = true
 
         do {
-            let items = try await service.fetchFeed(page: nextPage, limit: pageSize)
+            let fetchedCategories = try await service.fetchCategories()
+            guard !fetchedCategories.isEmpty else { return }
+
+            var normalizedCategories: [NewsCategoryFilter] = [.all]
+            for category in fetchedCategories where !category.isAll {
+                if !normalizedCategories.contains(where: { $0.id == category.id }) {
+                    normalizedCategories.append(category)
+                }
+            }
+            categories = normalizedCategories
+        } catch {
+            // Keep the built-in category list as a fallback.
+        }
+    }
+
+    private func fetchNextPage(prepend: Bool, generation: Int) async {
+        guard !reachedEnd else { return }
+        guard !(activeRequestCount > 0 && generation == requestGeneration) else { return }
+
+        let requestPage = nextPage
+        let requestCategory = selectedCategory.apiCode
+
+        activeRequestCount += 1
+        isLoading = true
+        defer {
+            activeRequestCount = max(0, activeRequestCount - 1)
+            isLoading = activeRequestCount > 0
+        }
+
+        do {
+            let items = try await service.fetchFeed(
+                page: requestPage,
+                limit: pageSize,
+                categoryCode: requestCategory
+            )
+
+            guard generation == requestGeneration,
+                  requestPage == nextPage,
+                  requestCategory == selectedCategory.apiCode else {
+                return
+            }
+
             let mappedCards = items.enumerated().map { index, item in
-                item.toNewsCard(styleIndex: (nextPage * pageSize) + index)
+                item.toNewsCard(styleIndex: (requestPage * pageSize) + index)
             }
 
             if mappedCards.count < pageSize {
@@ -156,6 +239,7 @@ final class NewsFeedViewModel: ObservableObject {
             loadError = nil
             await syncInteractionStateForLoadedCards()
         } catch {
+            guard generation == requestGeneration else { return }
             if let feedError = error as? FeedError {
                 loadError = feedError.localizedDescription
             } else {
@@ -462,10 +546,39 @@ private struct NewsInteractionStore {
 struct NewsFeedService {
     private let baseURL = URL(string: "https://newsbitapi.onrender.com")!
 
-    func fetchFeed(page: Int, limit: Int) async throws -> [FeedItem] {
-        var components = URLComponents(url: baseURL.appendingPathComponent("v1/feed"), resolvingAgainstBaseURL: false)
+    func fetchCategories() async throws -> [NewsCategoryFilter] {
+        let data = try await performRequest(url: baseURL.appendingPathComponent("v1/categories"))
+
+        do {
+            let decoded = try JSONDecoder().decode([APINewsCategory].self, from: data)
+            return decoded.map {
+                NewsCategoryFilter(
+                    code: $0.code.trimmingCharacters(in: .whitespacesAndNewlines).uppercased(),
+                    label: $0.label.trimmingCharacters(in: .whitespacesAndNewlines)
+                )
+            }
+        } catch {
+            throw FeedError.decodingFailed
+        }
+    }
+
+    func fetchFeed(page: Int, limit: Int, categoryCode: String? = nil) async throws -> [FeedItem] {
+        let normalizedPage = max(0, page)
+        let apiPage = normalizedPage + 1
+        let endpointURL: URL
+        if let categoryCode,
+           !categoryCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            endpointURL = baseURL
+                .appendingPathComponent("v1/categories")
+                .appendingPathComponent(categoryCode.uppercased())
+                .appendingPathComponent("feed")
+        } else {
+            endpointURL = baseURL.appendingPathComponent("v1/feed")
+        }
+
+        var components = URLComponents(url: endpointURL, resolvingAgainstBaseURL: false)
         components?.queryItems = [
-            URLQueryItem(name: "page", value: String(max(0, page))),
+            URLQueryItem(name: "page", value: String(apiPage)),
             URLQueryItem(name: "limit", value: String(min(max(1, limit), 100)))
         ]
 
@@ -473,24 +586,7 @@ struct NewsFeedService {
             throw URLError(.badURL)
         }
 
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("Basic cHVibGljOjEyMzQ1Njc4", forHTTPHeaderField: "Authorization")
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw FeedError.invalidResponse
-        }
-
-        if httpResponse.statusCode == 401 {
-            throw FeedError.unauthorized
-        }
-
-        guard (200...299).contains(httpResponse.statusCode) else {
-            throw FeedError.requestFailed(statusCode: httpResponse.statusCode)
-        }
+        let data = try await performRequest(url: url)
 
         let decoder = JSONDecoder()
         do {
@@ -518,11 +614,36 @@ struct NewsFeedService {
         return nil
     }
 
+    private func performRequest(url: URL) async throws -> Data {
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Basic cHVibGljOjEyMzQ1Njc4", forHTTPHeaderField: "Authorization")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw FeedError.invalidResponse
+        }
+
+        if httpResponse.statusCode == 401 {
+            throw FeedError.unauthorized
+        }
+
+        guard (200...299).contains(httpResponse.statusCode) else {
+            throw FeedError.requestFailed(
+                statusCode: httpResponse.statusCode,
+                message: APIErrorEnvelope.message(from: data)
+            )
+        }
+
+        return data
+    }
 }
 
 private enum FeedError: LocalizedError {
     case unauthorized
-    case requestFailed(statusCode: Int)
+    case requestFailed(statusCode: Int, message: String?)
     case decodingFailed
     case invalidResponse
 
@@ -530,13 +651,47 @@ private enum FeedError: LocalizedError {
         switch self {
         case .unauthorized:
             return "Feed API unauthorized. Check Basic auth credentials."
-        case .requestFailed(let statusCode):
+        case .requestFailed(let statusCode, let message):
+            if let message, !message.isEmpty {
+                return "Feed API request failed (HTTP \(statusCode)): \(message)"
+            }
             return "Feed API request failed (HTTP \(statusCode))."
         case .decodingFailed:
             return "Feed API response format is unexpected."
         case .invalidResponse:
             return "Feed API returned an invalid response."
         }
+    }
+}
+
+private struct APINewsCategory: Decodable {
+    let code: String
+    let label: String
+}
+
+private struct APIErrorEnvelope: Decodable {
+    let message: String?
+    let error: String?
+    let validationErrors: [String: String]?
+
+    static func message(from data: Data) -> String? {
+        guard let envelope = try? JSONDecoder().decode(APIErrorEnvelope.self, from: data) else {
+            return nil
+        }
+
+        if let message = envelope.message, !message.isEmpty {
+            if let validationErrors = envelope.validationErrors, !validationErrors.isEmpty {
+                let details = validationErrors
+                    .sorted { $0.key < $1.key }
+                    .map { "\($0.key): \($0.value)" }
+                    .joined(separator: ", ")
+                return "\(message) (\(details))"
+            }
+
+            return message
+        }
+
+        return envelope.error
     }
 }
 

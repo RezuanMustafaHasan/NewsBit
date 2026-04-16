@@ -1,9 +1,12 @@
 import SwiftUI
 import FirebaseAuth
+import PhotosUI
 
 @MainActor
 struct ProfileView: View {
     @ObservedObject var authViewModel: AuthViewModel
+    @State private var selectedPhotoItem: PhotosPickerItem?
+    @State private var isUploadingPhoto = false
 
     private let avatarColors = ["#0984E3", "#6C5CE7", "#00B894", "#E17055", "#E84393", "#2D3436"]
 
@@ -13,8 +16,28 @@ struct ProfileView: View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 24) {
-                    ProfileInitialAvatarView(profile: currentProfile)
-                        .frame(width: 130, height: 130)
+                    VStack(spacing: 12) {
+                        ProfileInitialAvatarView(profile: currentProfile)
+                            .frame(width: 130, height: 130)
+
+                        PhotosPicker(
+                            selection: $selectedPhotoItem,
+                            matching: .images
+                        ) {
+                            Label(
+                                currentProfile?.avatarImageBase64 == nil ? "Upload Profile Photo" : "Change Profile Photo",
+                                systemImage: "photo.on.rectangle"
+                            )
+                            .font(.subheadline.weight(.semibold))
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(isUploadingPhoto)
+
+                        if isUploadingPhoto {
+                            ProgressView("Uploading photo...")
+                                .font(.caption)
+                        }
+                    }
 
                     VStack(alignment: .leading, spacing: 10) {
                         Text("Avatar Color")
@@ -79,6 +102,13 @@ struct ProfileView: View {
             .task {
                 await authViewModel.fetchProfile()
             }
+            .onChange(of: selectedPhotoItem) { _, newItem in
+                guard let newItem else { return }
+
+                Task {
+                    await uploadProfilePhoto(from: newItem)
+                }
+            }
         }
     }
 
@@ -120,28 +150,39 @@ struct ProfileView: View {
         let days = max(components.day ?? 0, 0)
         return days == 1 ? "1 day" : "\(days) days"
     }
+
+    private func uploadProfilePhoto(from item: PhotosPickerItem) async {
+        isUploadingPhoto = true
+        defer {
+            isUploadingPhoto = false
+            selectedPhotoItem = nil
+        }
+
+        do {
+            guard let imageData = try await item.loadTransferable(type: Data.self) else {
+                authViewModel.authError = "Unable to read the selected photo."
+                return
+            }
+
+            await authViewModel.updateProfilePhoto(with: imageData)
+        } catch {
+            authViewModel.authError = "Unable to load the selected photo."
+        }
+    }
 }
 
 struct ProfileInitialAvatarView: View {
     let profile: UserProfile?
 
     var body: some View {
-        ZStack {
-            Circle()
-                .fill(Color(hex: profile?.avatarColorHex ?? "#0984E3"))
-
-            Text(initial)
-                .font(.system(size: 54, weight: .bold, design: .rounded))
-                .foregroundStyle(.white)
-        }
+        AvatarCircleView(
+            username: profile?.username ?? "User",
+            avatarColorHex: profile?.avatarColorHex ?? "#0984E3",
+            avatarImageBase64: profile?.avatarImageBase64,
+            fontSize: 54
+        )
         .overlay(Circle().stroke(Color.white, lineWidth: 4))
         .shadow(color: .black.opacity(0.14), radius: 10, x: 0, y: 4)
-    }
-
-    private var initial: String {
-        let name = profile?.username.trimmingCharacters(in: .whitespacesAndNewlines) ?? "U"
-        guard let first = name.first else { return "U" }
-        return String(first).uppercased()
     }
 }
 

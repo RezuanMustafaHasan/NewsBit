@@ -5,6 +5,7 @@ struct MainTabShellView: View {
     enum Tab {
         case home
         case favorites
+        case messages
         case search
         case profile
     }
@@ -20,6 +21,8 @@ struct MainTabShellView: View {
                     HomeView(userID: authViewModel.currentUser?.uid)
                 case .favorites:
                     FavoritesView(userID: authViewModel.currentUser?.uid)
+                case .messages:
+                    MessagesView(currentUserID: authViewModel.currentUser?.uid)
                 case .search:
                     SearchView()
                 case .profile:
@@ -44,6 +47,7 @@ struct BottomNavigationBar: View {
             HStack(spacing: 0) {
                 navButton(title: "Home", icon: "house.fill", tab: .home)
                 navButton(title: "Favorites", icon: "heart.fill", tab: .favorites)
+                navButton(title: "Messages", icon: "paperplane.fill", tab: .messages)
                 navButton(title: "Search", icon: "magnifyingglass", tab: .search)
                 navButton(title: "Profile", icon: "person.crop.circle", tab: .profile)
             }
