@@ -138,7 +138,8 @@ final class AuthViewModel: ObservableObject {
                 email: cleanedEmail,
                 gender: gender,
                 avatarColorHex: defaultAvatarColorHex(for: gender),
-                avatarImageBase64: nil
+                avatarImageBase64: nil,
+                coverImageBase64: nil
             )
 
             currentUser = authResult.user
@@ -191,7 +192,8 @@ final class AuthViewModel: ObservableObject {
                 gender: gender,
                 createdAt: createdAt,
                 avatarColorHex: data["avatarColorHex"] as? String ?? defaultAvatarColorHex(for: gender),
-                avatarImageBase64: data["avatarImageBase64"] as? String
+                avatarImageBase64: data["avatarImageBase64"] as? String,
+                coverImageBase64: data["coverImageBase64"] as? String
             )
         } catch {
             let nsError = error as NSError
@@ -240,6 +242,43 @@ final class AuthViewModel: ObservableObject {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 firestore.collection("users").document(uid).setData([
                     "avatarImageBase64": base64,
+                    "updatedAt": FieldValue.serverTimestamp()
+                ], merge: true) { error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume()
+                    }
+                }
+            }
+
+            await fetchProfile()
+        } catch {
+            authError = mapError(error)
+        }
+    }
+
+    func updateCoverPhoto(with imageData: Data) async {
+        guard usesFirebase else { return }
+        guard let uid = currentUser?.uid else { return }
+
+        authError = nil
+
+        guard let preparedData = AvatarImageCodec.preparedJPEGData(
+            from: imageData,
+            maxPixelSize: 1400,
+            compressionQuality: 0.76
+        ) else {
+            authError = "Unable to process the selected cover photo."
+            return
+        }
+
+        let base64 = preparedData.base64EncodedString()
+
+        do {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                firestore.collection("users").document(uid).setData([
+                    "coverImageBase64": base64,
                     "updatedAt": FieldValue.serverTimestamp()
                 ], merge: true) { error in
                     if let error {
@@ -315,7 +354,8 @@ final class AuthViewModel: ObservableObject {
         email: String,
         gender: String,
         avatarColorHex: String,
-        avatarImageBase64: String?
+        avatarImageBase64: String?,
+        coverImageBase64: String?
     ) async throws {
         var data: [String: Any] = [
             "uid": uid,
@@ -328,6 +368,10 @@ final class AuthViewModel: ObservableObject {
 
         if let avatarImageBase64, !avatarImageBase64.isEmpty {
             data["avatarImageBase64"] = avatarImageBase64
+        }
+
+        if let coverImageBase64, !coverImageBase64.isEmpty {
+            data["coverImageBase64"] = coverImageBase64
         }
 
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -511,6 +555,7 @@ struct UserProfile {
     let createdAt: Date?
     let avatarColorHex: String
     let avatarImageBase64: String?
+    let coverImageBase64: String?
 }
 
 enum AuthFlowError: LocalizedError {

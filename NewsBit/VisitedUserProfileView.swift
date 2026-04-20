@@ -92,8 +92,7 @@ struct VisitedUserProfileView: View {
 
     private var bannerHeader: some View {
         VStack(spacing: 0) {
-            Rectangle()
-                .fill(viewModel.bannerGradient)
+            bannerArtwork
                 .frame(height: 170)
                 .overlay(alignment: .bottomLeading) {
                     Text("Highlights")
@@ -201,6 +200,29 @@ struct VisitedUserProfileView: View {
         }
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         .padding(.horizontal, 12)
+    }
+
+    @ViewBuilder
+    private var bannerArtwork: some View {
+        if let coverImage = AvatarImageCodec.image(fromBase64: viewModel.profile?.coverImageBase64) {
+            Image(uiImage: coverImage)
+                .resizable()
+                .scaledToFill()
+                .overlay {
+                    LinearGradient(
+                        colors: [
+                            Color.black.opacity(0.04),
+                            Color.black.opacity(0.16),
+                            Color.black.opacity(0.42)
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                }
+        } else {
+            Rectangle()
+                .fill(viewModel.bannerGradient)
+        }
     }
 
     private func statColumn(value: Int, label: String) -> some View {
@@ -382,6 +404,7 @@ struct VisitedUserProfile {
     let gender: String
     let avatarColorHex: String
     let avatarImageBase64: String?
+    let coverImageBase64: String?
     let createdAt: Date?
 }
 
@@ -584,6 +607,7 @@ final class VisitedUserProfileViewModel: ObservableObject {
             gender: data["gender"] as? String ?? "-",
             avatarColorHex: data["avatarColorHex"] as? String ?? "#0984E3",
             avatarImageBase64: data["avatarImageBase64"] as? String,
+            coverImageBase64: data["coverImageBase64"] as? String,
             createdAt: (data["createdAt"] as? Timestamp)?.dateValue()
         )
     }

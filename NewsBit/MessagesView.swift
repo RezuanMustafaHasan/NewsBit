@@ -269,25 +269,8 @@ struct DirectMessagesStore {
         let users = try await socialStore.fetchUsers(ids: orderedOtherUserIDs)
         let usersByID = Dictionary(uniqueKeysWithValues: users.map { ($0.id, $0) })
 
-        return snapshot.documents.compactMap { document in
-            let data = document.data()
-            let participants = (data["participantIDs"] as? [String]) ?? []
-            guard let otherUserID = participants.first(where: { $0 != currentUserID }),
-                  let otherUser = usersByID[otherUserID] else {
-                return nil
-            }
-
-            let lastMessageAt = (data["lastMessageAt"] as? Timestamp)?.dateValue() ?? .distantPast
-            let kind = DirectMessageKind(rawValue: (data["lastMessageType"] as? String) ?? "") ?? .text
-            let lastMessageText = (data["lastMessageText"] as? String) ?? ""
-
-            return ConversationSummary(
-                id: document.documentID,
-                otherUser: otherUser,
-                lastMessageText: lastMessageText,
-                lastMessageAt: lastMessageAt,
-                kind: kind
-            )
+        return snapshot.documents.compactMap {
+            conversationSummary(from: $0, currentUserID: currentUserID, usersByID: usersByID)
         }
         .sorted { $0.lastMessageAt > $1.lastMessageAt }
     }
@@ -300,18 +283,92 @@ struct DirectMessagesStore {
             .order(by: "createdAt", descending: false)
             .getDocuments()
 
-        return snapshot.documents.map { document in
-            let data = document.data()
-            return DirectMessageItem(
-                id: document.documentID,
-                senderID: (data["senderID"] as? String) ?? "",
-                recipientID: (data["recipientID"] as? String) ?? "",
-                text: (data["text"] as? String) ?? "",
-                createdAt: (data["createdAt"] as? Timestamp)?.dateValue() ?? Date(),
-                kind: DirectMessageKind(rawValue: (data["type"] as? String) ?? "") ?? .text,
-                sharedNews: SharedNewsPayload(data)
-            )
-        }
+        return snapshot.documents.map(messageItem(from:))
+    }
+
+    @discardableResult
+    func listenConversations(
+        currentUserID: String,
+        onUpdate: @escaping ([ConversationSummary]) -> Void,
+        onError: @escaping (String) -> Void
+    ) -> ListenerRegistration {
+        db.collection("conversations")
+            .whereField("participantIDs", arrayContains: currentUserID)
+            .addSnapshotListener { [socialStore] snapshot, error in
+                if error != nil {
+                    Task { @MainActor in
+                        onError("Unable to load messages right now.")
+                    }
+                    return
+                }
+
+                guard let snapshot else {
+                    Task { @MainActor in
+                        onUpdate([])
+                    }
+                    return
+                }
+
+                let documents = snapshot.documents
+                Task {
+                    do {
+                        var orderedOtherUserIDs: [String] = []
+                        var seen = Set<String>()
+
+                        for document in documents {
+                            let participants = (document.data()["participantIDs"] as? [String]) ?? []
+                            guard let otherUserID = participants.first(where: { $0 != currentUserID }),
+                                  seen.insert(otherUserID).inserted else {
+                                continue
+                            }
+                            orderedOtherUserIDs.append(otherUserID)
+                        }
+
+                        let users = try await socialStore.fetchUsers(ids: orderedOtherUserIDs)
+                        let usersByID = Dictionary(uniqueKeysWithValues: users.map { ($0.id, $0) })
+                        let conversations = documents.compactMap {
+                            conversationSummary(from: $0, currentUserID: currentUserID, usersByID: usersByID)
+                        }
+                        .sorted { $0.lastMessageAt > $1.lastMessageAt }
+
+                        await MainActor.run {
+                            onUpdate(conversations)
+                        }
+                    } catch {
+                        await MainActor.run {
+                            onError("Unable to load messages right now.")
+                        }
+                    }
+                }
+            }
+    }
+
+    @discardableResult
+    func listenMessages(
+        currentUserID: String,
+        otherUserID: String,
+        onUpdate: @escaping ([DirectMessageItem]) -> Void,
+        onError: @escaping (String) -> Void
+    ) -> ListenerRegistration {
+        let conversationID = canonicalConversationID(currentUserID, otherUserID)
+
+        return db.collection("conversations")
+            .document(conversationID)
+            .collection("messages")
+            .order(by: "createdAt", descending: false)
+            .addSnapshotListener { snapshot, error in
+                if error != nil {
+                    Task { @MainActor in
+                        onError("Unable to load this conversation right now.")
+                    }
+                    return
+                }
+
+                let messages = snapshot?.documents.map(messageItem(from:)) ?? []
+                Task { @MainActor in
+                    onUpdate(messages)
+                }
+            }
     }
 
     func sendText(_ text: String, from sender: SocialUser, to recipient: SocialUser) async throws {
@@ -392,6 +449,44 @@ struct DirectMessagesStore {
     private func canonicalConversationID(_ firstUserID: String, _ secondUserID: String) -> String {
         [firstUserID, secondUserID].sorted().joined(separator: "_")
     }
+
+    private func conversationSummary(
+        from document: QueryDocumentSnapshot,
+        currentUserID: String,
+        usersByID: [String: SocialUser]
+    ) -> ConversationSummary? {
+        let data = document.data()
+        let participants = (data["participantIDs"] as? [String]) ?? []
+        guard let otherUserID = participants.first(where: { $0 != currentUserID }),
+              let otherUser = usersByID[otherUserID] else {
+            return nil
+        }
+
+        let lastMessageAt = (data["lastMessageAt"] as? Timestamp)?.dateValue() ?? .distantPast
+        let kind = DirectMessageKind(rawValue: (data["lastMessageType"] as? String) ?? "") ?? .text
+        let lastMessageText = (data["lastMessageText"] as? String) ?? ""
+
+        return ConversationSummary(
+            id: document.documentID,
+            otherUser: otherUser,
+            lastMessageText: lastMessageText,
+            lastMessageAt: lastMessageAt,
+            kind: kind
+        )
+    }
+
+    private func messageItem(from document: QueryDocumentSnapshot) -> DirectMessageItem {
+        let data = document.data()
+        return DirectMessageItem(
+            id: document.documentID,
+            senderID: (data["senderID"] as? String) ?? "",
+            recipientID: (data["recipientID"] as? String) ?? "",
+            text: (data["text"] as? String) ?? "",
+            createdAt: (data["createdAt"] as? Timestamp)?.dateValue() ?? Date(),
+            kind: DirectMessageKind(rawValue: (data["type"] as? String) ?? "") ?? .text,
+            sharedNews: SharedNewsPayload(data)
+        )
+    }
 }
 
 @MainActor
@@ -404,9 +499,14 @@ final class MessagesViewModel: ObservableObject {
     let currentUserID: String?
     private let socialStore = SocialGraphStore()
     private let messagesStore = DirectMessagesStore()
+    private var conversationsListener: ListenerRegistration?
 
     init(currentUserID: String?) {
         self.currentUserID = currentUserID
+    }
+
+    deinit {
+        conversationsListener?.remove()
     }
 
     func load() async {
@@ -414,21 +514,37 @@ final class MessagesViewModel: ObservableObject {
             errorMessage = "Sign in to use messages."
             conversations = []
             connections = []
+            conversationsListener?.remove()
+            conversationsListener = nil
             return
         }
 
         isLoading = true
         errorMessage = nil
-        defer { isLoading = false }
+
+        conversationsListener?.remove()
+        conversationsListener = messagesStore.listenConversations(
+            currentUserID: currentUserID,
+            onUpdate: { [weak self] conversations in
+                guard let self else { return }
+                self.conversations = conversations
+                self.isLoading = false
+            },
+            onError: { [weak self] message in
+                guard let self else { return }
+                self.errorMessage = message
+                self.isLoading = false
+            }
+        )
 
         do {
-            async let conversationsTask = messagesStore.fetchConversations(currentUserID: currentUserID)
-            async let connectionsTask = socialStore.fetchConnections(for: currentUserID)
-
-            conversations = try await conversationsTask
-            connections = try await connectionsTask
+            connections = try await socialStore.fetchConnections(for: currentUserID)
         } catch {
             errorMessage = "Unable to load messages right now."
+        }
+
+        if conversations.isEmpty {
+            isLoading = false
         }
     }
 }
@@ -445,31 +561,44 @@ final class MessageThreadViewModel: ObservableObject {
     let otherUser: SocialUser
 
     private let messagesStore = DirectMessagesStore()
+    private var messagesListener: ListenerRegistration?
 
     init(currentUserID: String?, otherUser: SocialUser) {
         self.currentUserID = currentUserID
         self.otherUser = otherUser
     }
 
+    deinit {
+        messagesListener?.remove()
+    }
+
     func load() async {
         guard let currentUserID, !currentUserID.isEmpty else {
             errorMessage = "Sign in to use messages."
             messages = []
+            messagesListener?.remove()
+            messagesListener = nil
             return
         }
 
         isLoading = true
         errorMessage = nil
-        defer { isLoading = false }
 
-        do {
-            messages = try await messagesStore.fetchMessages(
-                currentUserID: currentUserID,
-                otherUserID: otherUser.id
-            )
-        } catch {
-            errorMessage = "Unable to load this conversation right now."
-        }
+        messagesListener?.remove()
+        messagesListener = messagesStore.listenMessages(
+            currentUserID: currentUserID,
+            otherUserID: otherUser.id,
+            onUpdate: { [weak self] messages in
+                guard let self else { return }
+                self.messages = messages
+                self.isLoading = false
+            },
+            onError: { [weak self] message in
+                guard let self else { return }
+                self.errorMessage = message
+                self.isLoading = false
+            }
+        )
     }
 
     func sendMessage() async {
@@ -493,10 +622,6 @@ final class MessageThreadViewModel: ObservableObject {
 
             try await messagesStore.sendText(trimmedDraft, from: sender, to: otherUser)
             draftText = ""
-            messages = try await messagesStore.fetchMessages(
-                currentUserID: currentUserID,
-                otherUserID: otherUser.id
-            )
         } catch {
             errorMessage = "Unable to send the message right now."
         }
@@ -576,103 +701,125 @@ struct MessagesView: View {
 
     var body: some View {
         NavigationStack {
-            Group {
-                if viewModel.currentUserID == nil {
-                    socialEmptyState(
-                        title: "Messages need an account",
-                        subtitle: "Sign in to follow people and send them stories or text messages."
-                    )
-                } else if viewModel.isLoading && viewModel.conversations.isEmpty && viewModel.connections.isEmpty {
-                    ProgressView("Loading messages...")
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 20) {
-                            if !viewModel.connections.isEmpty {
-                                Text("Friends")
-                                    .font(.headline)
-                                    .padding(.horizontal, 16)
+            ZStack {
+                PremiumHomeBackground()
 
-                                ScrollView(.horizontal, showsIndicators: false) {
-                                    HStack(spacing: 16) {
-                                        ForEach(viewModel.connections) { user in
+                Group {
+                    if viewModel.currentUserID == nil {
+                        socialEmptyState(
+                            title: "Messages need an account",
+                            subtitle: "Sign in to follow people and send them stories or text messages."
+                        )
+                    } else if viewModel.isLoading && viewModel.conversations.isEmpty && viewModel.connections.isEmpty {
+                        loadingState("Loading messages...")
+                    } else {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 24) {
+                                if !viewModel.connections.isEmpty {
+                                    sectionTitle("Friends")
+
+                                    ScrollView(.horizontal, showsIndicators: false) {
+                                        HStack(spacing: 14) {
+                                            ForEach(viewModel.connections) { user in
+                                                NavigationLink {
+                                                    MessageThreadView(
+                                                        currentUserID: viewModel.currentUserID,
+                                                        otherUser: user
+                                                    )
+                                                } label: {
+                                                    friendCard(user)
+                                                }
+                                                .buttonStyle(.plain)
+                                            }
+                                        }
+                                        .padding(.horizontal, 1)
+                                    }
+                                    .scrollIndicators(.hidden)
+                                }
+
+                                if viewModel.conversations.isEmpty {
+                                    socialEmptyState(
+                                        title: "No conversations yet",
+                                        subtitle: viewModel.connections.isEmpty
+                                            ? "Follow someone from search, then share a story upward from the feed."
+                                            : "Open a friend above to start chatting or share a story from the feed."
+                                    )
+                                } else {
+                                    sectionTitle("Inbox")
+
+                                    VStack(spacing: 12) {
+                                        ForEach(viewModel.conversations) { conversation in
                                             NavigationLink {
                                                 MessageThreadView(
                                                     currentUserID: viewModel.currentUserID,
-                                                    otherUser: user
+                                                    otherUser: conversation.otherUser
                                                 )
                                             } label: {
-                                                VStack(spacing: 8) {
-                                                    AvatarCircleView(
-                                                        username: user.username,
-                                                        avatarColorHex: user.avatarColorHex,
-                                                        avatarImageBase64: user.avatarImageBase64,
-                                                        fontSize: 20
-                                                    )
-                                                    .frame(width: 56, height: 56)
-
-                                                    Text(user.username)
-                                                        .font(.caption)
-                                                        .foregroundStyle(.primary)
-                                                        .lineLimit(1)
-                                                }
-                                                .frame(width: 72)
+                                                conversationRow(conversation)
                                             }
                                             .buttonStyle(.plain)
                                         }
                                     }
-                                    .padding(.horizontal, 16)
+                                }
+
+                                if let errorMessage = viewModel.errorMessage {
+                                    Text(errorMessage)
+                                        .font(.footnote)
+                                        .foregroundStyle(.red)
+                                        .padding(.horizontal, 2)
                                 }
                             }
-
-                            if viewModel.conversations.isEmpty {
-                                socialEmptyState(
-                                    title: "No conversations yet",
-                                    subtitle: viewModel.connections.isEmpty
-                                        ? "Follow someone from search, then share a story upward from the feed."
-                                        : "Open a friend above to start chatting or share a story from the feed."
-                                )
-                            } else {
-                                Text("Inbox")
-                                    .font(.headline)
-                                    .padding(.horizontal, 16)
-
-                                VStack(spacing: 10) {
-                                    ForEach(viewModel.conversations) { conversation in
-                                        NavigationLink {
-                                            MessageThreadView(
-                                                currentUserID: viewModel.currentUserID,
-                                                otherUser: conversation.otherUser
-                                            )
-                                        } label: {
-                                            conversationRow(conversation)
-                                        }
-                                        .buttonStyle(.plain)
-                                    }
-                                }
-                                .padding(.horizontal, 16)
-                            }
-
-                            if let errorMessage = viewModel.errorMessage {
-                                Text(errorMessage)
-                                    .font(.footnote)
-                                    .foregroundStyle(.red)
-                                    .padding(.horizontal, 16)
-                            }
+                            .padding(.horizontal, 16)
+                            .padding(.top, 14)
+                            .padding(.bottom, 28)
                         }
-                        .padding(.vertical, 16)
+                        .scrollIndicators(.hidden)
+                        .refreshable {
+                            await viewModel.load()
+                        }
                     }
-                    .background(Color(.systemGroupedBackground))
                 }
             }
             .navigationTitle("Messages")
+            .navigationBarTitleDisplayMode(.inline)
             .task {
                 await viewModel.load()
             }
-            .refreshable {
-                await viewModel.load()
-            }
         }
+    }
+
+    private func sectionTitle(_ title: String) -> some View {
+        Text(title)
+            .font(.system(size: 19, weight: .bold))
+            .foregroundStyle(HomePalette.primaryText)
+    }
+
+    private func friendCard(_ user: SocialUser) -> some View {
+        VStack(spacing: 10) {
+            AvatarCircleView(
+                username: user.username,
+                avatarColorHex: user.avatarColorHex,
+                avatarImageBase64: user.avatarImageBase64,
+                fontSize: 20
+            )
+            .frame(width: 58, height: 58)
+
+            Text(user.username)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(HomePalette.primaryText)
+                .lineLimit(1)
+        }
+        .frame(width: 86)
+        .padding(.vertical, 12)
+        .background(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(Color.white.opacity(0.88))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .stroke(HomePalette.softStroke, lineWidth: 1)
+                )
+                .shadow(color: HomePalette.shadow, radius: 14, x: 0, y: 8)
+        )
     }
 
     private func conversationRow(_ conversation: ConversationSummary) -> some View {
@@ -688,11 +835,11 @@ struct MessagesView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(conversation.otherUser.username)
                     .font(.headline)
-                    .foregroundStyle(.primary)
+                    .foregroundStyle(HomePalette.primaryText)
 
                 Text(conversation.previewText)
                     .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(HomePalette.mutedText)
                     .lineLimit(1)
             }
 
@@ -700,12 +847,17 @@ struct MessagesView: View {
 
             Text(shortRelativeTime(from: conversation.lastMessageAt))
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(HomePalette.mutedText)
         }
-        .padding(14)
+        .padding(16)
         .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(Color(.systemBackground))
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(Color.white.opacity(0.88))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .stroke(HomePalette.softStroke, lineWidth: 1)
+                )
+                .shadow(color: HomePalette.shadow, radius: 14, x: 0, y: 8)
         )
     }
 
@@ -713,13 +865,28 @@ struct MessagesView: View {
         VStack(spacing: 10) {
             Image(systemName: "paperplane.circle")
                 .font(.system(size: 44, weight: .regular))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(HomePalette.mutedText)
             Text(title)
-                .font(.headline)
+                .font(.system(size: 21, weight: .bold))
+                .foregroundStyle(HomePalette.primaryText)
             Text(subtitle)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(HomePalette.mutedText)
                 .multilineTextAlignment(.center)
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 30)
+        .frame(maxWidth: .infinity)
+        .homeGlassCard(cornerRadius: 28)
+    }
+
+    private func loadingState(_ title: String) -> some View {
+        VStack {
+            ProgressView(title)
+                .tint(HomePalette.accent)
+                .padding(.horizontal, 24)
+                .padding(.vertical, 28)
+                .homeGlassCard(cornerRadius: 28)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(.horizontal, 24)
@@ -729,6 +896,7 @@ struct MessagesView: View {
 struct MessageThreadView: View {
     @StateObject private var viewModel: MessageThreadViewModel
     @State private var selectedSharedNews: SharedNewsPayload?
+    @State private var isShowingUserProfile = false
 
     init(currentUserID: String?, otherUser: SocialUser) {
         _viewModel = StateObject(
@@ -740,27 +908,53 @@ struct MessageThreadView: View {
     }
 
     var body: some View {
-        Group {
+        ZStack {
+            PremiumHomeBackground()
+
             if viewModel.currentUserID == nil {
                 VStack(spacing: 12) {
                     Text("Sign in to use messages.")
                         .font(.subheadline)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(HomePalette.mutedText)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                VStack(spacing: 0) {
-                    messagesList
-                    Divider()
-                    composer
-                }
-                .background(Color(.systemGroupedBackground))
+                messagesList
             }
         }
-        .navigationTitle(viewModel.otherUser.username)
         .navigationBarTitleDisplayMode(.inline)
         .navigationDestination(item: $selectedSharedNews) { sharedNews in
             NewsDetailView(card: sharedNews.newsCard)
+        }
+        .navigationDestination(isPresented: $isShowingUserProfile) {
+            VisitedUserProfileView(
+                profileDocumentID: viewModel.otherUser.id,
+                userUID: viewModel.otherUser.id
+            )
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if viewModel.currentUserID != nil {
+                composer
+            }
+        }
+        .toolbar {
+            ToolbarItem(placement: .principal) {
+                Button {
+                    isShowingUserProfile = true
+                } label: {
+                    VStack(spacing: 0) {
+                        Text(viewModel.otherUser.username)
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundStyle(HomePalette.primaryText)
+                            .lineLimit(1)
+
+                        Text("View profile")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(HomePalette.mutedText)
+                    }
+                }
+                .buttonStyle(.plain)
+            }
         }
         .task {
             await viewModel.load()
@@ -771,14 +965,38 @@ struct MessageThreadView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 12) {
-                    ForEach(viewModel.messages) { message in
-                        messageBubble(message)
-                            .id(message.id)
+                    if viewModel.isLoading && viewModel.messages.isEmpty {
+                        ProgressView("Loading conversation...")
+                            .tint(HomePalette.accent)
+                            .padding(.top, 40)
+                    } else if viewModel.messages.isEmpty {
+                        VStack(spacing: 10) {
+                            Text("No messages yet")
+                                .font(.system(size: 19, weight: .bold))
+                                .foregroundStyle(HomePalette.primaryText)
+
+                            Text("Send the first message to start this conversation.")
+                                .font(.system(size: 15, weight: .medium))
+                                .foregroundStyle(HomePalette.mutedText)
+                                .multilineTextAlignment(.center)
+                        }
+                        .padding(.horizontal, 24)
+                        .padding(.vertical, 30)
+                        .frame(maxWidth: .infinity)
+                        .homeGlassCard(cornerRadius: 28)
+                        .padding(.top, 22)
+                    } else {
+                        ForEach(viewModel.messages) { message in
+                            messageBubble(message)
+                                .id(message.id)
+                        }
                     }
                 }
                 .padding(.horizontal, 16)
-                .padding(.vertical, 14)
+                .padding(.top, 14)
+                .padding(.bottom, 12)
             }
+            .scrollDismissesKeyboard(.interactively)
             .onChange(of: viewModel.messages.last?.id, initial: true) { _, messageID in
                 guard let messageID else { return }
                 withAnimation(.easeInOut(duration: 0.2)) {
@@ -821,31 +1039,31 @@ struct MessageThreadView: View {
                         if !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                             Text(message.text)
                                 .font(.subheadline)
-                                .foregroundStyle(isOutgoing ? Color.white : Color.primary)
+                                .foregroundStyle(isOutgoing ? Color.white : HomePalette.primaryText)
                                 .multilineTextAlignment(.leading)
                         }
 
                         newsSharePreview(sharedNews, isOutgoing: isOutgoing)
                     }
                     .padding(12)
-                    .background(isOutgoing ? Color.blue : Color(.secondarySystemBackground))
+                    .background(messageBubbleBackground(isOutgoing: isOutgoing))
                     .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
                 }
                 .buttonStyle(.plain)
             } else {
                 Text(message.text)
                     .font(.subheadline)
-                    .foregroundStyle(isOutgoing ? Color.white : Color.primary)
+                    .foregroundStyle(isOutgoing ? Color.white : HomePalette.primaryText)
                     .padding(.horizontal, 14)
                     .padding(.vertical, 10)
-                    .background(isOutgoing ? Color.blue : Color(.secondarySystemBackground))
+                    .background(messageBubbleBackground(isOutgoing: isOutgoing))
                     .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
                     .multilineTextAlignment(.leading)
             }
 
             Text(message.createdAt.formatted(date: .omitted, time: .shortened))
                 .font(.caption2)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(HomePalette.mutedText)
         }
     }
 
@@ -856,16 +1074,16 @@ struct MessageThreadView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(sharedNews.source)
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(isOutgoing ? Color.white.opacity(0.82) : Color.secondary)
+                    .foregroundStyle(isOutgoing ? Color.white.opacity(0.82) : HomePalette.mutedText)
 
                 Text(sharedNews.title)
                     .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(isOutgoing ? Color.white : Color.primary)
+                    .foregroundStyle(isOutgoing ? Color.white : HomePalette.primaryText)
                     .lineLimit(2)
 
                 Text(sharedNews.timeText)
                     .font(.caption)
-                    .foregroundStyle(isOutgoing ? Color.white.opacity(0.76) : Color.secondary)
+                    .foregroundStyle(isOutgoing ? Color.white.opacity(0.76) : HomePalette.mutedText)
             }
         }
     }
@@ -902,25 +1120,94 @@ struct MessageThreadView: View {
     }
 
     private var composer: some View {
-        HStack(alignment: .bottom, spacing: 10) {
-            TextField("Message", text: $viewModel.draftText, axis: .vertical)
-                .textFieldStyle(.roundedBorder)
-                .lineLimit(1...4)
-
-            Button("Send") {
+        MessageComposerBar(
+            text: $viewModel.draftText,
+            isSending: viewModel.isSending,
+            onSend: {
                 Task {
                     await viewModel.sendMessage()
                 }
             }
-            .buttonStyle(.borderedProminent)
-            .disabled(
-                viewModel.isSending
-                    || viewModel.draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            )
-        }
+        )
         .padding(.horizontal, 16)
-        .padding(.vertical, 12)
-        .background(Color(.systemBackground))
+        .padding(.top, 8)
+        // Keep a little separation from the tab bar without wasting vertical space.
+        .padding(.bottom, PremiumNavigationMetrics.composerClearance)
+        .background(
+            LinearGradient(
+                colors: [
+                    HomePalette.background.opacity(0),
+                    HomePalette.background.opacity(0.82),
+                    HomePalette.background
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        )
+    }
+
+    private func messageBubbleBackground(isOutgoing: Bool) -> some View {
+        RoundedRectangle(cornerRadius: 18, style: .continuous)
+            .fill(isOutgoing ? HomePalette.accent : Color.white.opacity(0.9))
+            .overlay(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .stroke(isOutgoing ? HomePalette.accent.opacity(0.2) : HomePalette.softStroke, lineWidth: 1)
+            )
+            .shadow(color: isOutgoing ? HomePalette.accent.opacity(0.12) : HomePalette.shadow, radius: 10, x: 0, y: 6)
+    }
+}
+
+private struct MessageComposerBar: View {
+    @Binding var text: String
+    let isSending: Bool
+    let onSend: () -> Void
+
+    var body: some View {
+        HStack(alignment: .bottom, spacing: 12) {
+            TextField("Write a message", text: $text, axis: .vertical)
+                .font(.system(size: 16, weight: .medium))
+                .foregroundStyle(HomePalette.primaryText)
+                .lineLimit(1...4)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 12)
+                .background(
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .fill(Color.white.opacity(0.92))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                .stroke(HomePalette.softStroke, lineWidth: 1)
+                        )
+                )
+
+            Button(action: onSend) {
+                Image(systemName: "arrow.up")
+                    .font(.system(size: 16, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 46, height: 46)
+                    .background(
+                        Circle()
+                            .fill(HomePalette.accent)
+                    )
+            }
+            .buttonStyle(PressableIconButtonStyle())
+            .disabled(isSending || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            .opacity(isSending || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? 0.5 : 1)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .fill(.ultraThinMaterial)
+                .background(
+                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .fill(Color.white.opacity(0.84))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .stroke(HomePalette.softStroke, lineWidth: 1)
+                )
+                .shadow(color: HomePalette.shadow, radius: 16, x: 0, y: 10)
+        )
     }
 }
 

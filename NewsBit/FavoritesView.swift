@@ -16,54 +16,13 @@ struct FavoritesView: View {
 
     var body: some View {
         NavigationStack {
-            Group {
-                if viewModel.isLoading && viewModel.items.isEmpty {
-                    ProgressView("Loading favorites...")
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else if let errorMessage = viewModel.errorMessage {
-                    VStack(spacing: 10) {
-                        Text(errorMessage)
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                        Button("Retry") {
-                            Task {
-                                await viewModel.loadFavorites()
-                            }
-                        }
-                        .buttonStyle(.borderedProminent)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else if viewModel.items.isEmpty {
-                    Text("No favorite news yet.")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    List {
-                        ForEach(viewModel.items) { item in
-                            FavoriteRow(
-                                item: item,
-                                onTap: {
-                                    Task {
-                                        let card = await viewModel.fetchNewsDetails(for: item)
-                                        selectedCard = card
-                                        isShowingDetail = true
-                                    }
-                                }
-                            ) {
-                                Task {
-                                    let didUnfavorite = await viewModel.unfavorite(item: item)
-                                    if didUnfavorite {
-                                        showUndo(for: item)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    .listStyle(.plain)
-                }
+            ZStack {
+                PremiumHomeBackground()
+
+                favoritesContent
             }
             .navigationTitle("Favorites")
+            .navigationBarTitleDisplayMode(.inline)
             .task {
                 await viewModel.loadFavorites()
             }
@@ -71,9 +30,6 @@ struct FavoritesView: View {
                 if let selectedCard {
                     NewsDetailView(card: selectedCard)
                 }
-            }
-            .refreshable {
-                await viewModel.loadFavorites()
             }
         }
         .overlay(alignment: .bottomTrailing) {
@@ -89,14 +45,109 @@ struct FavoritesView: View {
                 .font(.subheadline.weight(.semibold))
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
-                .background(.black.opacity(0.82), in: Capsule())
-                .foregroundStyle(.white)
+                .foregroundStyle(HomePalette.accent)
+                .homeGlassCard(cornerRadius: 20)
                 .padding(.trailing, 16)
                 .padding(.bottom, 22)
                 .transition(.move(edge: .trailing).combined(with: .opacity))
             }
         }
         .animation(.easeInOut(duration: 0.2), value: pendingUndoItem?.id)
+    }
+
+    @ViewBuilder
+    private var favoritesContent: some View {
+        if viewModel.isLoading && viewModel.items.isEmpty {
+            progressState("Loading favorites...")
+        } else if let errorMessage = viewModel.errorMessage {
+            statusCard(
+                title: "Unable to load favorites",
+                subtitle: errorMessage,
+                actionTitle: "Retry"
+            ) {
+                Task {
+                    await viewModel.loadFavorites()
+                }
+            }
+        } else if viewModel.items.isEmpty {
+            statusCard(
+                title: "No favorite news yet",
+                subtitle: "Stories you save will appear here for quick reading later."
+            )
+        } else {
+            ScrollView {
+                LazyVStack(spacing: 14) {
+                    ForEach(viewModel.items) { item in
+                        FavoriteRow(
+                            item: item,
+                            onTap: {
+                                Task {
+                                    let card = await viewModel.fetchNewsDetails(for: item)
+                                    selectedCard = card
+                                    isShowingDetail = true
+                                }
+                            }
+                        ) {
+                            Task {
+                                let didUnfavorite = await viewModel.unfavorite(item: item)
+                                if didUnfavorite {
+                                    showUndo(for: item)
+                                }
+                            }
+                        }
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 14)
+                .padding(.bottom, 28)
+            }
+            .scrollIndicators(.hidden)
+            .refreshable {
+                await viewModel.loadFavorites()
+            }
+        }
+    }
+
+    private func progressState(_ title: String) -> some View {
+        VStack {
+            ProgressView(title)
+                .tint(HomePalette.accent)
+                .padding(.horizontal, 24)
+                .padding(.vertical, 28)
+                .homeGlassCard(cornerRadius: 28)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(.horizontal, 24)
+    }
+
+    private func statusCard(
+        title: String,
+        subtitle: String,
+        actionTitle: String? = nil,
+        action: (() -> Void)? = nil
+    ) -> some View {
+        VStack(spacing: 14) {
+            Text(title)
+                .font(.system(size: 22, weight: .bold))
+                .foregroundStyle(HomePalette.primaryText)
+
+            Text(subtitle)
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(HomePalette.mutedText)
+                .multilineTextAlignment(.center)
+
+            if let actionTitle, let action {
+                Button(actionTitle, action: action)
+                    .buttonStyle(.borderedProminent)
+                    .tint(HomePalette.accent)
+            }
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 28)
+        .frame(maxWidth: .infinity)
+        .homeGlassCard(cornerRadius: 28)
+        .padding(.horizontal, 24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func showUndo(for item: FavoriteNewsItem) {
@@ -125,17 +176,33 @@ private struct FavoriteRow: View {
     let onUnfavorite: () -> Void
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 14) {
             thumbnail
 
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 8) {
                 Text(item.title)
-                    .font(.headline)
-                    .lineLimit(2)
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(HomePalette.primaryText)
+                    .lineLimit(3)
 
-                Text(item.dateText)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 6) {
+                    Label(item.dateText, systemImage: "clock")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(HomePalette.mutedText)
+                        .lineLimit(1)
+
+                    HStack(spacing: 8) {
+                        Label(item.source, systemImage: "newspaper")
+                            .font(.caption)
+                            .foregroundStyle(HomePalette.mutedText)
+                            .lineLimit(1)
+
+                        Text(item.timeText)
+                            .font(.caption)
+                            .foregroundStyle(HomePalette.mutedText)
+                            .lineLimit(1)
+                    }
+                }
             }
 
             Spacer()
@@ -144,11 +211,28 @@ private struct FavoriteRow: View {
                 Image(systemName: "heart.fill")
                     .font(.system(size: 18, weight: .semibold))
                     .foregroundStyle(.red)
-                    .padding(8)
+                    .frame(width: 38, height: 38)
+                    .background(
+                        Circle()
+                            .fill(Color.white.opacity(0.96))
+                    )
+                    .overlay(
+                        Circle()
+                            .stroke(HomePalette.softStroke, lineWidth: 1)
+                    )
             }
             .buttonStyle(.plain)
         }
-        .padding(.vertical, 4)
+        .padding(16)
+        .background(
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .fill(Color.white.opacity(0.88))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .stroke(HomePalette.softStroke, lineWidth: 1)
+                )
+                .shadow(color: HomePalette.shadow, radius: 16, x: 0, y: 10)
+        )
         .contentShape(Rectangle())
         .onTapGesture(perform: onTap)
     }
@@ -166,12 +250,12 @@ private struct FavoriteRow: View {
                     placeholderThumbnail
                 }
             }
-            .frame(width: 64, height: 64)
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .frame(width: 82, height: 82)
+            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         } else {
             placeholderThumbnail
-                .frame(width: 64, height: 64)
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .frame(width: 82, height: 82)
+                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         }
     }
 

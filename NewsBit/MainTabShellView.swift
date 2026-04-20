@@ -14,7 +14,7 @@ struct MainTabShellView: View {
     @State private var selectedTab: Tab = .home
 
     var body: some View {
-        VStack(spacing: 0) {
+        ZStack(alignment: .bottom) {
             Group {
                 switch selectedTab {
                 case .home:
@@ -30,51 +30,12 @@ struct MainTabShellView: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(.bottom, PremiumNavigationMetrics.barReservedHeight)
 
-            BottomNavigationBar(selectedTab: $selectedTab)
+            PremiumBottomNavigationBar(selectedTab: $selectedTab)
+                .ignoresSafeArea(.keyboard, edges: .bottom)
         }
-        .ignoresSafeArea(edges: .bottom)
-    }
-}
-
-struct BottomNavigationBar: View {
-    @Binding var selectedTab: MainTabShellView.Tab
-
-    var body: some View {
-        VStack(spacing: 0) {
-            Divider()
-
-            HStack(spacing: 0) {
-                navButton(title: "Home", icon: "house.fill", tab: .home)
-                navButton(title: "Favorites", icon: "heart.fill", tab: .favorites)
-                navButton(title: "Messages", icon: "paperplane.fill", tab: .messages)
-                navButton(title: "Search", icon: "magnifyingglass", tab: .search)
-                navButton(title: "Profile", icon: "person.crop.circle", tab: .profile)
-            }
-            .padding(.top, 10)
-            .padding(.bottom, 12)
-            .frame(maxWidth: .infinity)
-            .background(Color(.systemBackground))
-        }
-        .frame(maxWidth: .infinity)
-        .background(Color(.systemBackground))
-    }
-
-    @ViewBuilder
-    private func navButton(title: String, icon: String, tab: MainTabShellView.Tab) -> some View {
-        Button {
-            selectedTab = tab
-        } label: {
-            VStack(spacing: 4) {
-                Image(systemName: icon)
-                    .font(.system(size: 18, weight: .semibold))
-                Text(title)
-                    .font(.caption)
-            }
-            .foregroundStyle(selectedTab == tab ? .blue : .secondary)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 6)
-        }
-        .buttonStyle(.plain)
+        .background(HomePalette.background.ignoresSafeArea())
+        .animation(.spring(response: 0.32, dampingFraction: 0.86), value: selectedTab)
     }
 }

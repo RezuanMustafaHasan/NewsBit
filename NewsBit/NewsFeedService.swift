@@ -624,8 +624,31 @@ struct NewsFeedService {
         }
     }
 
+    func fetchDetailedCard(id cardID: String, fallbackCard: NewsCard? = nil) async throws -> NewsCard {
+        let item = try await fetchArticle(id: cardID)
+        let fallbackSummary = fallbackCard?.summary.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let fallbackFullText = fallbackCard?.fullText.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        return NewsCard(
+            id: item.id,
+            source: item.source,
+            title: item.title,
+            time: item.publishedAt?.relativeTimeText ?? fallbackCard?.time ?? "Just now",
+            summary: item.summary.isEmpty ? fallbackSummary : item.summary,
+            fullText: item.content.isEmpty ? (fallbackFullText.isEmpty ? fallbackSummary : fallbackFullText) : item.content,
+            commentCount: fallbackCard?.commentCount ?? 0,
+            imageURL: item.imageURL ?? fallbackCard?.imageURL,
+            thumbnailSymbol: fallbackCard?.thumbnailSymbol ?? NewsCardStyle.orange.symbol,
+            imageGradient: fallbackCard?.imageGradient ?? NewsCardStyle.orange.gradient
+        )
+    }
+
     func fetchCard(matching cardID: String, pageSize: Int = 20, maxPages: Int = 6) async throws -> NewsCard? {
         guard !cardID.isEmpty else { return nil }
+
+        if let detailedCard = try? await fetchDetailedCard(id: cardID) {
+            return detailedCard
+        }
 
         for page in 0..<maxPages {
             let items = try await fetchFeed(page: page, limit: pageSize)
@@ -639,6 +662,21 @@ struct NewsFeedService {
         }
 
         return nil
+    }
+
+    private func fetchArticle(id cardID: String) async throws -> FeedItem {
+        let url = baseURL
+            .appendingPathComponent("v1")
+            .appendingPathComponent("articles")
+            .appendingPathComponent(cardID)
+
+        let data = try await performRequest(url: url)
+
+        do {
+            return try JSONDecoder().decode(FeedItem.self, from: data)
+        } catch {
+            throw FeedError.decodingFailed
+        }
     }
 
     private func performRequest(url: URL) async throws -> Data {
