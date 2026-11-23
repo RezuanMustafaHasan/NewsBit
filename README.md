@@ -1,8 +1,11 @@
 # NewsBit
 
-NewsBit is an iOS news app built with SwiftUI.
+An iPhone app for reading and discussing news. The SwiftUI client uses Firebase
+Authentication and Cloud Firestore for accounts and social features. The
+[companion Spring Boot service](https://github.com/RezuanMustafaHasan/NewsBitAPI)
+provides article data and an admin dashboard.
 
-It lets users create an account, read news, save stories, comment on posts, follow other users, and send messages. The app also has profile customization, highlighted stories, and search for both news and users.
+[See screenshots of the news feed, comments, and messages](#screenshots).
 
 ## What This App Can Do
 
@@ -50,6 +53,8 @@ It lets users create an account, read news, save stories, comment on posts, foll
 
 ## How To Run
 
+The project targets iOS 26.4. Use an Xcode version with a compatible SDK and simulator.
+
 1. Open `NewsBit.xcodeproj` in Xcode.
 2. Wait for Xcode to download the Swift packages.
 3. Make sure `NewsBit/GoogleService-Info.plist` matches your Firebase project.
@@ -70,7 +75,7 @@ This app uses Firebase for:
 - comments and replies
 - direct messages
 
-This app uses the NewsBit API for:
+The app uses the [NewsBit API](https://github.com/RezuanMustafaHasan/NewsBitAPI) for:
 
 - news feed
 - category list
@@ -123,7 +128,3 @@ If you change the bundle ID, you will also need a new `GoogleService-Info.plist`
 <p align="center">
   <img src="images/user_profile_4_highlights.jpeg" alt="User highlights screen" width="240" />
 </p>
-
-## Summary
-
-NewsBit is a social news reading app for iPhone. It mixes reading, saving, commenting, following, and messaging in one place.
